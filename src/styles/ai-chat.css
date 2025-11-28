@@ -1,0 +1,99 @@
+/* Force left alignment for ALL chat messages */
+.chat-message {
+    display: flex !important;
+    gap: 0.75rem;
+    margin-bottom: 1.5rem;
+    align-items: flex-start !important;
+    width: 100% !important;
+    max-width: 100% !important;
+}
+
+.chat-message--user,
+.chat-message--ai {
+    justify-content: flex-start !important;
+    align-self: flex-start !important;
+    margin-left: 0 !important;
+    margin-right: auto !important;
+    width: 100% !important;
+    max-width: 100% !important;
+}
+
+.chat-message__avatar {
+    flex-shrink: 0;
+    width: 40px;
+    height: 40px;
+}
+
+.chat-message__body {
+    flex: 1;
+    min-width: 0;
+    max-width: max-content !important;
+}
+
+/* Red AI avatar */
+.accura-icon {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #dc2626 0%, #ef4444 100%) !important;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 4px 12px rgba(220, 38, 38, 0.3) !important;
+}
+
+/* Transparent user bubble */
+.user-question-bubble {
+    background: rgba(255, 255, 255, 0.05) !important;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: var(--text-primary);
+    padding: 0.875rem 1.125rem;
+    border-radius: 1.25rem;
+    border-bottom-left-radius: 0.375rem;
+    font-size: 0.9375rem;
+    line-height: 1.5;
+    display: inline-flex;
+}
+
+/* Transparent AI answer */
+.ai-answer-body {
+    background: transparent !important;
+    border: none !important;
+    padding: 1rem 0 !important;
+    color: var(--text-primary) !important;
+}
+
+/* Red thinking animation */
+.clean-thinking-container {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.875rem 1.125rem;
+    background: rgba(220, 38, 38, 0.08) !important;
+    border: 1px solid rgba(220, 38, 38, 0.2) !important;
+    border-radius: 1.25rem;
+    border-bottom-left-radius: 0.375rem;
+}
+
+.thinking-dots span {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #dc2626 !important;
+    box-shadow: 0 0 8px rgba(220, 38, 38, 0.4) !important;
+}
+
+/* Red send button */
+.ai-send-button {
+    background: linear-gradient(135deg, #dc2626 0%, #ef4444 100%) !important;
+    box-shadow: 0 4px 12px rgba(220, 38, 38, 0.3) !important;
+}
+
+.ai-send-button:hover:not(:disabled) {
+    box-shadow: 0 6px 16px rgba(220, 38, 38, 0.4) !important;
+}
+
+.ai-input-row .form-input:focus {
+    border-color: #dc2626 !important;
+    box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.1) !important;
+}

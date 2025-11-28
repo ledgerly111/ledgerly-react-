@@ -1,0 +1,787 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import Chart from 'chart.js/auto';
+import { PieChart } from '@mui/x-charts/PieChart';
+import { useAppActions, useAppState } from '../context/AppContext.jsx';
+import { inboxNotifications } from '../utils/ai.js';
+import { downloadInvoicePdf } from '../utils/invoicePdf.jsx';
+import { buildInvoiceFromSale } from '../utils/invoiceUtils.js';
+import { formatCurrency } from '../utils/currency.js';
+import {
+  Card,
+  CardHeader,
+  CardTitle,
+  CardDescription,
+  CardContent,
+} from '../components/ui/card.jsx';
+import { Badge } from '../components/ui/badge.jsx';
+
+const QUICK_ACTIONS = [
+  { id: 'add-sale', icon: 'fas fa-plus', label: 'New Sale', description: 'Multi-product', className: 'perplexity-button', targetView: 'sales', permission: 'sales.create' },
+  { id: 'add-expense', icon: 'fas fa-receipt', label: 'Add Expense', description: 'Track costs', className: 'expenses-button', targetView: 'expenses', permission: 'expenses.create' },
+  { id: 'add-product', icon: 'fas fa-box', label: 'Add Product', description: 'Expand inventory', className: 'ai-button', targetView: 'products', permission: 'products.manage' },
+  { id: 'add-customer', icon: 'fas fa-user-plus', label: 'New Customer', description: 'Grow base', className: 'bot-button', targetView: 'customers', permission: 'customers.create' },
+];
+
+function useSalesChart(chartConfig, { glowColor = 'rgba(16, 185, 129, 0.65)' } = {}) {
+  const canvasRef = useRef(null);
+  const chartInstanceRef = useRef(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      chartInstanceRef.current?.destroy();
+      chartInstanceRef.current = null;
+      return undefined;
+    }
+    const context = canvas.getContext('2d');
+    if (!context) {
+      return undefined;
+    }
+
+    const height = canvas.height || canvas.clientHeight || 280;
+    const gradient = context.createLinearGradient(0, 0, 0, height);
+    gradient.addColorStop(0, 'rgba(16, 185, 129, 0.35)');
+    gradient.addColorStop(1, 'rgba(16, 185, 129, 0.05)');
+
+    const datasetConfig = {
+      ...chartConfig.datasets[0],
+      backgroundColor: gradient,
+      borderColor: chartConfig.datasets[0].borderColor ?? '#00d4aa',
+      pointBackgroundColor: '#0f172a',
+      pointBorderColor: chartConfig.datasets[0].borderColor ?? '#00d4aa',
+      pointBorderWidth: 2,
+    };
+
+    const glowPlugin = {
+      id: 'outerGlow',
+      beforeDatasetsDraw(chart, args, pluginOptions) {
+        const { ctx } = chart;
+        ctx.save();
+        ctx.shadowBlur = pluginOptions?.blur ?? 20;
+        ctx.shadowColor = pluginOptions?.color ?? glowColor;
+      },
+      afterDatasetsDraw(chart) {
+        chart.ctx.restore();
+      },
+    };
+
+    chartInstanceRef.current?.destroy();
+
+    chartInstanceRef.current = new Chart(context, {
+      type: 'line',
+      data: {
+        labels: chartConfig.labels,
+        datasets: [datasetConfig],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          outerGlow: { color: glowColor, blur: 20 },
+          tooltip: {
+            displayColors: false,
+            backgroundColor: 'rgba(15, 23, 42, 0.92)',
+            borderColor: glowColor,
+            borderWidth: 1,
+            callbacks: {
+              label(context) {
+                const value = context.parsed.y ?? context.parsed ?? 0;
+                return typeof chartConfig.tooltipFormatter === 'function'
+                  ? chartConfig.tooltipFormatter(value, context)
+                  : value;
+              },
+            },
+          },
+        },
+        scales: {
+          x: {
+            ticks: { color: '#9ca3af', padding: 10, maxRotation: 0 },
+            grid: { color: 'rgba(148, 163, 184, 0.12)' },
+            border: { color: 'rgba(148, 163, 184, 0.2)' },
+          },
+          y: {
+            beginAtZero: true,
+            ticks: {
+              color: '#9ca3af',
+              padding: 8,
+              callback(value) {
+                return typeof chartConfig.yTickFormatter === 'function'
+                  ? chartConfig.yTickFormatter(value)
+                  : value;
+              },
+            },
+            grid: { color: 'rgba(148, 163, 184, 0.12)' },
+            border: { color: 'rgba(148, 163, 184, 0.2)' },
+          },
+        },
+      },
+      plugins: [glowPlugin],
+    });
+
+    return () => {
+      chartInstanceRef.current?.destroy();
+      chartInstanceRef.current = null;
+    };
+  }, [chartConfig, glowColor]);
+
+  return {
+    salesCanvasRef: canvasRef,
+  };
+}
+
+function scopeDataForUser(state, user) {
+  if (user.role === 'admin') {
+    return { sales: state.sales, expenses: state.expenses };
+  }
+
+  if (user.role === 'manager') {
+    const workerIds = state.users.filter((u) => u.role === 'worker').map((u) => u.id);
+    const managedIds = new Set([user.id, ...workerIds]);
+    return {
+      sales: state.sales.filter((sale) => managedIds.has(sale.salesPersonId)),
+      expenses: state.expenses.filter((expense) => managedIds.has(expense.createdByUserId ?? expense.addedBy)),
+    };
+  }
+
+  return {
+    sales: state.sales.filter((sale) => sale.salesPersonId === user.id),
+    expenses: state.expenses.filter((expense) => (expense.createdByUserId ?? expense.addedBy) === user.id),
+  };
+}
+
+function buildSalesByMonth(sales) {
+  const monthlyTotals = new Map();
+
+  sales.forEach((sale) => {
+    if (!sale?.date) return;
+    const date = new Date(sale.date);
+    if (Number.isNaN(date.getTime())) return;
+
+    const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+    const label = date.toLocaleString('default', { month: 'short', year: 'numeric' });
+    const previous = monthlyTotals.get(key);
+
+    monthlyTotals.set(key, {
+      label,
+      total: (previous?.total ?? 0) + (sale.total ?? 0),
+    });
+  });
+
+  return Array.from(monthlyTotals.values());
+}
+
+function buildRecentSales(sales) {
+  return [...sales]
+    .sort((a, b) => new Date(b.date) - new Date(a.date))
+    .slice(0, 5);
+}
+
+export default function DashboardView() {
+  const state = useAppState();
+  const actions = useAppActions();
+  const currentUser = state.currentUser;
+  const [notificationIndex, setNotificationIndex] = useState(0);
+  const [notificationCollapsed, setNotificationCollapsed] = useState(false);
+  const { sales = [], invoices = [], customers = [], products = [], users = [], selectedCountry, companyName, hasFeaturePermission } = state;
+  const rotatingNotification = inboxNotifications?.[notificationIndex % (inboxNotifications.length || 1)] ?? null;
+
+  useEffect(() => {
+    if (!Array.isArray(inboxNotifications) || inboxNotifications.length === 0) {
+      return undefined;
+    }
+    const active = inboxNotifications[notificationIndex % inboxNotifications.length];
+    const timeout = active?.duration ?? 5000;
+    const timer = setTimeout(() => {
+      setNotificationIndex((prev) => (prev + 1) % inboxNotifications.length);
+    }, timeout);
+    return () => clearTimeout(timer);
+  }, [notificationIndex]);
+
+  const handleToggleNotificationBar = () => {
+    setNotificationCollapsed((prev) => !prev);
+  };
+
+  if (!currentUser) {
+    return null;
+  }
+
+  const { sales: scopedSales, expenses: scopedExpenses } = useMemo(
+    () => scopeDataForUser(state, currentUser),
+    [state, currentUser],
+  );
+
+  const totalRevenue = useMemo(
+    () => scopedSales.reduce((sum, sale) => sum + (sale.total ?? 0), 0),
+    [scopedSales],
+  );
+  const totalExpenses = useMemo(
+    () => scopedExpenses.reduce((sum, expense) => sum + (expense.amount ?? 0), 0),
+    [scopedExpenses],
+  );
+  const netProfit = totalRevenue - totalExpenses;
+
+  const lowStockProducts = useMemo(
+    () => state.products.filter((product) => product.stock <= (state.lowStockThreshold ?? 10)),
+    [state.products, state.lowStockThreshold],
+  );
+
+  const recentSales = useMemo(() => buildRecentSales(scopedSales), [scopedSales]);
+  const totalInventoryValue = useMemo(
+    () => state.products.reduce((sum, product) => sum + (product.price ?? 0) * (product.stock ?? 0), 0),
+    [state.products],
+  );
+
+  const totalProducts = state.products.length;
+  const totalCustomers = state.customers.length;
+  const totalSalesCount = scopedSales.length;
+
+  const monthlySalary = (currentUser.salary ?? 0) / 12;
+  const totalEarnings = monthlySalary + (currentUser.commission ?? 0);
+
+  const salesByMonth = useMemo(() => buildSalesByMonth(scopedSales), [scopedSales]);
+
+  const salesPerformanceData = useMemo(
+    () => salesByMonth.map((entry) => ({
+      key: entry.key,
+      label: entry.label,
+      total: entry.total,
+    })),
+    [salesByMonth],
+  );
+
+  const extendedSalesPerformance = useMemo(() => {
+    if (salesPerformanceData.length === 0) {
+      return [];
+    }
+    if (salesPerformanceData.length > 1) {
+      return salesPerformanceData;
+    }
+    const [first] = salesPerformanceData;
+    const baseDate = new Date(`${first.key}-01T00:00:00`);
+    if (Number.isNaN(baseDate.getTime())) {
+      return [
+        { ...first, label: 'Previous', total: 0 },
+        first,
+      ];
+    }
+    const previousDate = new Date(baseDate);
+    previousDate.setMonth(previousDate.getMonth() - 1);
+    const previousKey = `${previousDate.getFullYear()}-${String(previousDate.getMonth() + 1).padStart(2, '0')}`;
+    return [
+      {
+        key: previousKey,
+        label: previousDate.toLocaleString('default', { month: 'short', year: 'numeric' }),
+        total: 0,
+      },
+      first,
+    ];
+  }, [salesPerformanceData]);
+
+  const lastSalesPoint = extendedSalesPerformance[extendedSalesPerformance.length - 1] ?? null;
+  const trendDelta = lastSalesPoint && extendedSalesPerformance.length > 1
+    ? lastSalesPoint.total - extendedSalesPerformance[extendedSalesPerformance.length - 2].total
+    : null;
+
+  const financePieData = useMemo(() => {
+    const entries = [
+      {
+        id: 'revenue',
+        label: 'Revenue',
+        value: Math.max(totalRevenue, 0),
+        color: 'rgba(0, 212, 170, 0.8)',
+      },
+      {
+        id: 'expenses',
+        label: 'Expenses',
+        value: Math.max(totalExpenses, 0),
+        color: 'rgba(239, 68, 68, 0.8)',
+      },
+      {
+        id: 'net',
+        label: netProfit >= 0 ? 'Net Profit' : 'Net Loss',
+        value: Math.abs(netProfit),
+        color: netProfit >= 0 ? 'rgba(59, 130, 246, 0.8)' : 'rgba(249, 115, 22, 0.85)',
+      },
+    ].filter((entry) => entry.value > 0);
+
+    return entries;
+  }, [totalRevenue, totalExpenses, netProfit]);
+
+  const pieValueFormatter = useCallback(
+    ({ value }) => formatCurrency(value ?? 0, { countryCode: state.selectedCountry, showSymbol: true }),
+    [state.selectedCountry],
+  );
+
+  const role = currentUser?.role ?? 'guest';
+
+  const canUsePermission = useCallback(
+    (permissionKey) => {
+      if (!permissionKey) {
+        return true;
+      }
+      if (role === 'admin') {
+        return true;
+      }
+      if (typeof hasFeaturePermission === 'function') {
+        return hasFeaturePermission(currentUser?.id, permissionKey);
+      }
+      return false;
+    },
+    [currentUser?.id, hasFeaturePermission, role],
+  );
+
+  const quickActions = useMemo(
+    () => QUICK_ACTIONS.filter((action) => !action.permission || canUsePermission(action.permission)),
+    [canUsePermission],
+  );
+
+  const formatValue = (value) => formatCurrency(value, { countryCode: state.selectedCountry });
+  const formatAxisValue = useCallback(
+    (value) => new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(value ?? 0),
+    [],
+  );
+
+  const displayMonths = Math.max(salesPerformanceData.length, 1);
+
+  const salesChartConfig = useMemo(() => {
+    const labels = extendedSalesPerformance.map((entry) => entry.label);
+    const points = extendedSalesPerformance.map((entry) => entry.total);
+    return {
+      labels,
+      datasets: [
+        {
+          label: `Monthly Sales (${state.selectedCountry})`,
+          data: points,
+          borderColor: '#00d4aa',
+          tension: 0.35,
+          fill: true,
+          pointRadius: points.length > 1 ? 4 : 5,
+          pointHoverRadius: 6,
+        },
+      ],
+      tooltipFormatter: (value) => formatCurrency(value, { countryCode: state.selectedCountry, showSymbol: true }),
+      yTickFormatter: formatAxisValue,
+    };
+  }, [extendedSalesPerformance, state.selectedCountry, formatAxisValue]);
+
+  const { salesCanvasRef } = useSalesChart(salesChartConfig, { glowColor: 'rgba(16, 185, 129, 0.65)' });
+
+  const handleQuickAction = (action) => {
+    if (action.permission && !canUsePermission(action.permission)) {
+      actions.pushNotification({ type: 'warning', message: `You do not have permission to use ${action.label}.` });
+      return;
+    }
+
+    if (action.targetView) {
+      actions.setView(action.targetView);
+      return;
+    }
+
+    actions.pushNotification({
+      type: 'info',
+      message: action.pendingMessage ?? `${action.label} action coming soon.`,
+    });
+  };
+  const handleInvoiceClick = useCallback(async (saleId) => {
+    const sale = sales.find((entry) => entry.id === saleId);
+    if (!sale) {
+      actions.pushNotification({ type: 'error', message: 'Sale #' + saleId + ' not found.' });
+      return;
+    }
+
+    const existingInvoice = invoices.find((invoice) => invoice.saleId === saleId || invoice.originSaleId === saleId);
+    const invoice = existingInvoice ?? buildInvoiceFromSale(sale, { customers, products, users });
+    if (!invoice) {
+      actions.pushNotification({ type: 'error', message: 'Unable to build invoice from this sale.' });
+      return;
+    }
+
+    try {
+      await downloadInvoicePdf(invoice, { companyName, countryCode: selectedCountry });
+      actions.pushNotification({
+        type: 'success',
+        message: 'Invoice downloaded',
+        description: (invoice.invoiceNumber ?? ('Sale #' + saleId)),
+      });
+    } catch (error) {
+      console.error('Failed to generate invoice PDF', error);
+      actions.pushNotification({ type: 'error', message: 'Unable to generate invoice PDF right now.' });
+    }
+  }, [actions, sales, invoices, customers, products, users, companyName, selectedCountry]);
+
+  const netProfitClass = netProfit >= 0 ? 'text-blue-400' : 'text-red-400';
+  const netProfitIconContainer = netProfit >= 0 ? 'bg-blue-500/20' : 'bg-red-500/20';
+  const netProfitIcon = netProfit >= 0 ? 'text-blue-400' : 'text-red-400';
+  const displayName = currentUser.name ?? 'User';
+  const showLiveEarnings = ['worker', 'manager'].includes(currentUser.role);
+
+  return (
+    <div className="space-y-6 fade-in">
+      <div className="flex flex-col gap-2">
+        <h2 className="text-2xl lg:text-3xl font-bold text-white">Dashboard Overview</h2>
+        <p className="text-gray-400">Welcome back, {displayName}!</p>
+      </div>
+
+      {rotatingNotification ? (
+        <div className="space-y-2">
+          <div className={`inbox-notification-wrapper ${notificationCollapsed ? 'collapsed' : ''}`}>
+            <div className="inbox-notification-bar">
+              <div className="w-full">
+                <div className="notification-message animate-notification-appear">
+                  <div className={`avatar ${rotatingNotification.avatarBackground ?? 'legacy-avatar-gradient'}`}>
+                    <i className="fas fa-bell" />
+                  </div>
+                  <div className="content">
+                    <div className={`username ${rotatingNotification.color ?? 'text-blue-400'}`}>
+                      {rotatingNotification.username}
+                    </div>
+                    <div className="text">{rotatingNotification.content}</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            id="dashboard-notification-toggle"
+            data-action="toggle-dashboard-notification-bar"
+            className="notification-toggle-btn"
+            onClick={handleToggleNotificationBar}
+            aria-label="Toggle dashboard notifications"
+          >
+            <i className={`fas ${notificationCollapsed ? 'fa-chevron-down' : 'fa-chevron-up'}`} />
+          </button>
+        </div>
+      ) : null}
+
+      {showLiveEarnings ? (
+        <div className="perplexity-card p-6 slide-up">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-xl font-bold text-white flex items-center">
+              <i className="fas fa-coins text-teal-400 mr-2" />
+              Live Earnings
+            </h3>
+            <div className="flex items-center space-x-2">
+              <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />
+              <span className="text-sm text-green-400 font-medium">LIVE</span>
+            </div>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="text-center p-4 bg-gradient-to-r from-green-500/10 to-emerald-500/10 rounded-xl border border-green-500/20">
+              <div className="text-green-400 text-2xl mb-2">SAL</div>
+              <p className="text-gray-400 text-sm mb-2">Monthly Salary</p>
+              <p className="text-lg font-bold text-green-400" data-target={monthlySalary} data-format="currency">
+                {formatValue(monthlySalary)}
+              </p>
+            </div>
+            <div className="text-center p-4 bg-gradient-to-r from-blue-500/10 to-cyan-500/10 rounded-xl border border-blue-500/20">
+              <div className="text-blue-400 text-2xl mb-2">COM</div>
+              <p className="text-gray-400 text-sm mb-2">Commission</p>
+              <p className="text-lg font-bold text-blue-400" data-target={currentUser.commission ?? 0} data-format="currency">
+                {formatValue(currentUser.commission ?? 0)}
+              </p>
+            </div>
+            <div className="text-center p-4 bg-gradient-to-r from-teal-500/10 to-blue-500/10 rounded-xl border border-teal-500/20">
+              <div className="text-teal-400 text-2xl mb-2">TOT</div>
+              <p className="text-gray-400 text-sm mb-2">Total Earnings</p>
+              <p className="text-xl font-bold text-teal-400" data-target={totalEarnings} data-format="currency">
+                {formatValue(totalEarnings)}
+              </p>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      <div className="responsive-grid-6">
+        <div className="perplexity-card p-4 hover:scale-105 transition-all duration-300 slide-up">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-gray-400 text-sm mb-1">Products</p>
+              <p className="text-2xl font-bold text-white">{totalProducts}</p>
+            </div>
+            <div className="w-10 h-10 bg-blue-500/20 rounded-xl flex items-center justify-center">
+              <i className="fas fa-box text-blue-400" />
+            </div>
+          </div>
+        </div>
+
+        <div className="perplexity-card p-4 hover:scale-105 transition-all duration-300 slide-up">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-gray-400 text-sm mb-1">Customers</p>
+              <p className="text-2xl font-bold text-white">{totalCustomers}</p>
+            </div>
+            <div className="w-10 h-10 bg-green-500/20 rounded-xl flex items-center justify-center">
+              <i className="fas fa-users text-green-400" />
+            </div>
+          </div>
+        </div>
+
+        <div className="perplexity-card p-4 hover:scale-105 transition-all duration-300 slide-up">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-gray-400 text-sm mb-1">Sales</p>
+              <p className="text-2xl font-bold text-white">{totalSalesCount}</p>
+            </div>
+            <div className="w-10 h-10 bg-purple-500/20 rounded-xl flex items-center justify-center">
+              <i className="fas fa-shopping-cart text-purple-400" />
+            </div>
+          </div>
+        </div>
+
+        <div className="perplexity-card p-4 hover:scale-105 transition-all duration-300 slide-up">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-gray-400 text-sm mb-1">Revenue</p>
+              <p className="text-lg font-bold text-green-400">{formatValue(totalRevenue)}</p>
+            </div>
+            <div className="w-10 h-10 bg-green-500/20 rounded-xl flex items-center justify-center">
+              <i className="fas fa-arrow-up text-green-400" />
+            </div>
+          </div>
+        </div>
+
+        <div className="perplexity-card p-4 hover:scale-105 transition-all duration-300 slide-up">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-gray-400 text-sm mb-1">Net Profit</p>
+              <p className={`text-xl font-bold ${netProfitClass}`}>{formatValue(netProfit)}</p>
+            </div>
+            <div className={`w-10 h-10 ${netProfitIconContainer} rounded-xl flex items-center justify-center`}>
+              <i className={`fas fa-chart-line ${netProfitIcon}`} />
+            </div>
+          </div>
+        </div>
+
+        <div className="perplexity-card p-4 hover:scale-105 transition-all duration-300 slide-up">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-gray-400 text-sm mb-1">Inventory Value</p>
+              <p className="text-lg font-bold text-yellow-400">{formatValue(totalInventoryValue)}</p>
+            </div>
+            <div className="w-10 h-10 bg-yellow-500/20 rounded-xl flex items-center justify-center">
+              <i className="fas fa-boxes text-yellow-400" />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <Card className="slide-up border-gray-700/70 bg-gray-900/40">
+          <CardHeader className="flex flex-col gap-2 pb-0 lg:flex-row lg:items-start lg:justify-between lg:space-y-0">
+            <div>
+              <CardTitle className="text-white text-xl">Sales Performance</CardTitle>
+              <CardDescription>
+                {salesPerformanceData.length
+                  ? `Revenue trend across the last ${displayMonths} ${displayMonths === 1 ? 'month' : 'months'}.`
+                  : 'We will chart your revenue trend as soon as you record sales.'}
+              </CardDescription>
+            </div>
+            <Badge variant="secondary">
+              {salesPerformanceData.length > 0
+                ? `Last ${displayMonths} ${displayMonths === 1 ? 'Month' : 'Months'}`
+                : 'Awaiting data'}
+            </Badge>
+          </CardHeader>
+          <CardContent className="pt-6">
+            {salesPerformanceData.length ? (
+              <div className="h-[280px]">
+                <canvas ref={salesCanvasRef} className="h-full w-full" />
+              </div>
+            ) : (
+              <p className="text-gray-400 text-sm text-center py-12">
+                Record a sale to start tracking sales performance.
+              </p>
+            )}
+            {trendDelta != null ? (
+              <div className="mt-5 flex items-center justify-between rounded-xl border border-gray-700/60 bg-gray-800/40 px-4 py-3 text-sm text-gray-300">
+                <span>Last month vs previous</span>
+                <span className={trendDelta >= 0 ? 'text-emerald-400 font-semibold' : 'text-red-400 font-semibold'}>
+                  {trendDelta >= 0 ? '+' : '-'}
+                  {formatCurrency(Math.abs(trendDelta), { countryCode: state.selectedCountry, showSymbol: true })}
+                </span>
+              </div>
+            ) : null}
+          </CardContent>
+        </Card>
+
+        <Card className="slide-up border-gray-700/70 bg-gray-900/40">
+          <CardHeader className="flex flex-col gap-2 pb-0 lg:flex-row lg:items-start lg:justify-between lg:space-y-0">
+            <div>
+              <CardTitle className="text-white text-xl">Financial Overview</CardTitle>
+              <CardDescription>
+                Revenue vs. expenses split for the selected region.
+              </CardDescription>
+            </div>
+            <Badge variant="secondary">Current Mix</Badge>
+          </CardHeader>
+          <CardContent className="pt-6">
+            {financePieData.length ? (
+              <div className="flex justify-center pointer-events-none">
+                <PieChart
+                  series={[{
+                    data: financePieData,
+                    highlightScope: { fade: 'global', highlight: 'item' },
+                    faded: { innerRadius: 30, additionalRadius: -20, color: 'rgba(148, 163, 184, 0.25)' },
+                    innerRadius: 42,
+                    outerRadius: 90,
+                    cornerRadius: 6,
+                    paddingAngle: 2,
+                    startAngle: 90,
+                    endAngle: 450,
+                    valueFormatter: pieValueFormatter,
+                  }]}
+                  height={220}
+                  width={220}
+                  slotProps={{ legend: { hidden: true } }}
+                  style={{ pointerEvents: 'none' }}
+                />
+              </div>
+            ) : (
+              <p className="text-gray-400 text-sm text-center">No financial data yet.</p>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <Card className="slide-up border-gray-700/70 bg-gray-900/40">
+          <CardHeader className="flex flex-col gap-2 pb-0">
+            <CardTitle className="text-white text-xl flex items-center gap-2">
+              <i className="fas fa-bolt text-yellow-400" />
+              Quick Actions
+            </CardTitle>
+            <CardDescription>Jump directly into your most common workflows.</CardDescription>
+          </CardHeader>
+          <CardContent className="pt-6">
+            <div className="grid grid-cols-2 gap-4">
+              {quickActions.map((action) => (
+                <button
+                  key={action.id}
+                  type="button"
+                  className={`${action.className} p-4 rounded-xl text-center hover:scale-105 transition-all duration-300`}
+                  onClick={() => handleQuickAction(action)}
+                >
+                  <i className={`${action.icon} text-xl mb-2`} />
+                  <div className="font-medium">{action.label}</div>
+                  <div className="text-xs opacity-80 mt-1">{action.description}</div>
+                </button>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+
+        <div className="perplexity-card p-6 slide-up">
+          <h3 className="text-xl font-bold text-white mb-4 flex items-center">
+            <i className="fas fa-clock text-blue-400 mr-2" />
+            Recent Activity
+          </h3>
+          {recentSales.length > 0 ? (
+            <div className="space-y-3">
+              {recentSales.map((sale) => {
+                const customer = state.customers.find((c) => c.id === sale.customerId);
+                const firstItem = sale.items?.[0];
+                const productName = firstItem
+                  ? state.products.find((product) => product.id === firstItem.productId)?.name
+                  : null;
+                const itemSummary = sale.items?.length > 1
+                  ? `${sale.items.length} items`
+                  : firstItem
+                    ? `${firstItem.quantity ?? 0} x ${productName ?? 'Item'}`
+                    : 'No items recorded';
+
+  return (
+                  <div
+                    key={sale.id}
+                    className="flex justify-between items-center p-3 bg-gray-800/50 rounded-xl border border-gray-600/30 hover:border-teal-500/50 transition-all duration-300"
+                  >
+                    <div className="flex items-center space-x-3">
+                      <div className="w-8 h-8 bg-gradient-to-r from-teal-500 to-blue-500 rounded-lg flex items-center justify-center">
+                        <i className="fas fa-shopping-bag text-white text-sm" />
+                      </div>
+                      <div>
+                        <p className="text-white font-medium text-sm">{itemSummary}</p>
+                        <p className="text-gray-400 text-xs">{customer?.name ?? 'Customer'}</p>
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <p className="text-white font-bold">{formatValue(sale.total ?? 0)}</p>
+                      <button
+                        type="button"
+                        className="text-teal-400 hover:text-teal-300 text-xs"
+                        onClick={() => handleInvoiceClick(sale.id)}
+                      >
+                        <i className="fas fa-file-invoice mr-1" />
+                        Invoice
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="text-center py-8 text-gray-400">
+              <i className="fas fa-chart-line text-3xl mb-3 opacity-50" />
+              <p className="mb-2">No recent sales</p>
+              <button
+                type="button"
+                className="perplexity-button px-4 py-2 rounded-xl"
+                onClick={() => actions.setView('sales')}
+              >
+                <i className="fas fa-plus mr-2" />
+                Record Sale
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {lowStockProducts.length > 0 ? (
+        <div className="perplexity-card p-6 border-l-4 border-red-500 bg-gradient-to-r from-red-500/10 to-transparent slide-up">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-xl font-bold text-white flex items-center">
+              <i className="fas fa-exclamation-triangle text-red-400 mr-2 animate-pulse" />
+              Stock Alert
+            </h3>
+            <span className="px-3 py-1 bg-red-500/20 text-red-400 rounded-full text-sm font-medium">
+              {lowStockProducts.length} Items
+            </span>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+            {lowStockProducts.slice(0, 6).map((product) => (
+              <div
+                key={product.id}
+                className="bg-red-500/10 border border-red-500/30 rounded-xl p-3 hover:border-red-500/50 transition-all duration-300"
+              >
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-white font-medium text-sm">{product.name}</p>
+                    <p className="text-red-400 text-sm font-bold">{product.stock ?? 0} left</p>
+                  </div>
+                  <div className="text-red-400 text-xl">
+                    <i className="fas fa-exclamation-triangle" />
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-4 text-center">
+            <button
+              type="button"
+              className="perplexity-button px-4 py-2 rounded-xl"
+              onClick={() => actions.setView('products')}
+            >
+              <i className="fas fa-box mr-2" />
+              Manage Inventory
+            </button>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+
+

@@ -1,0 +1,2235 @@
+import { createContext, useContext, useEffect, useMemo, useReducer, useRef } from 'react';
+import { defaultCountryCode } from '../constants/gccCountries.js';
+import { createNotification } from '../utils/notifications.js';
+import { buildExpenseJournalEntry, buildInitialJournal, buildSaleJournalEntries, removeJournalEntriesByReference, replaceJournalEntries, createJournalEntry as buildManualJournalEntry } from '../utils/journal.js';
+
+const LOCAL_STORAGE_KEY = 'OwlioData';
+const THEME_STORAGE_KEY = 'OwlioTheme';
+
+const createTimestamp = () => new Date().toISOString();
+function computeConversationId(message) {
+  if (!message) {
+    return null;
+  }
+  if (message.conversationId) {
+    return message.conversationId;
+  }
+  if (message.threadId) {
+    return message.threadId;
+  }
+  if (message.branchId != null) {
+    return `branch-${message.branchId}`;
+  }
+  if (message.type === 'task') {
+    if (message.taskId != null) {
+      return `task-${message.taskId}`;
+    }
+    if (message.rootMessageId != null) {
+      return `task-${message.rootMessageId}`;
+    }
+    if (message.id != null) {
+      return `task-${message.id}`;
+    }
+  }
+  const sender = message.senderId ?? message.from;
+  const recipient = message.recipientId ?? message.to;
+  if (sender != null && recipient != null) {
+    return [sender, recipient].sort().join(':');
+  }
+  return `message-${message.id ?? Date.now()}`;
+}
+
+function normalizeReactions(reactions) {
+  if (!Array.isArray(reactions)) {
+    return [];
+  }
+  return reactions
+    .map((reaction) => {
+      if (!reaction || !reaction.emoji) {
+        return null;
+      }
+      const users = Array.isArray(reaction.users)
+        ? Array.from(new Set(reaction.users.filter((id) => id != null)))
+        : [];
+      return {
+        emoji: reaction.emoji,
+        users,
+      };
+    })
+    .filter(Boolean);
+}
+
+function normalizeStoredMessage(message) {
+  if (!message) {
+    return null;
+  }
+  const timestamp = message.timestamp ?? new Date().toISOString();
+  const senderId = message.senderId ?? message.from ?? null;
+  const recipientId = message.recipientId ?? message.to ?? null;
+  const conversationId = computeConversationId({ ...message, senderId, recipientId });
+  const baseType = message.type ?? 'direct';
+  const conversationType = message.conversationType
+    ?? (message.branchId != null
+      ? 'branch'
+      : baseType === 'task'
+        ? 'task'
+        : 'direct');
+  const replyToId = message.replyToId
+    ?? (message.replyTo && typeof message.replyTo === 'object' ? message.replyTo.id : message.replyTo)
+    ?? null;
+  const readBy = Array.isArray(message.readBy)
+    ? Array.from(new Set(message.readBy.filter((id) => id != null)))
+    : [];
+  const taskStatus = message.taskStatus ?? message.status ?? null;
+
+  return {
+    ...message,
+    id: message.id ?? Date.now(),
+    from: senderId,
+    senderId,
+    to: recipientId,
+    recipientId,
+    conversationId,
+    conversationType,
+    timestamp,
+    reactions: normalizeReactions(message.reactions),
+    replyToId,
+    readBy,
+    read: message.read === true,
+    taskStatus,
+  };
+}
+
+function getUserDisplayName(user) {
+  if (!user) {
+    return null;
+  }
+  return user.name ?? user.username ?? null;
+}
+
+function deriveTaskActions(status) {
+  switch (status) {
+    case 'pending_worker_approval':
+      return [
+        { value: 'send-stock-request', label: 'Send to Manager' },
+        { value: 'decline-request', label: 'Decline' },
+      ];
+    case 'pending_manager_approval':
+      return [
+        { value: 'approve-stock-request', label: 'Approve' },
+        { value: 'decline-request', label: 'Decline' },
+      ];
+    case 'approved_pending_acceptance':
+      return [
+        { value: 'accept-stock', label: 'Accept Stock' },
+      ];
+    default:
+      return [];
+  }
+}
+
+function selectConversations(state) {
+  const messages = Array.isArray(state.messages) ? state.messages : [];
+  const users = Array.isArray(state.users) ? state.users : [];
+  const currentUserId = state.currentUser?.id ?? null;
+  const userById = new Map(users.map((user) => [user.id, user]));
+  const conversationMap = new Map();
+
+  messages.forEach((rawMessage) => {
+    const normalized = normalizeStoredMessage(rawMessage);
+    if (!normalized) {
+      return;
+    }
+    const conversationId = normalized.conversationId;
+    if (!conversationMap.has(conversationId)) {
+      conversationMap.set(conversationId, {
+        id: conversationId,
+        type: normalized.conversationType,
+        branchId: normalized.branchId ?? null,
+        branchName: normalized.branchName ?? null,
+        title: normalized.conversationTitle ?? normalized.subject ?? normalized.taskTitle ?? null,
+        participantIds: new Set(),
+        lastMessageAt: null,
+        lastMessageTs: 0,
+        previewText: '',
+        unreadCount: 0,
+        taskStatus: normalized.taskStatus ?? null,
+        messages: [],
+      });
+    }
+    const bucket = conversationMap.get(conversationId);
+    bucket.messages.push(normalized);
+    if (normalized.from != null) {
+      bucket.participantIds.add(normalized.from);
+    }
+    if (normalized.to != null) {
+      bucket.participantIds.add(normalized.to);
+    }
+    if (Array.isArray(normalized.participantIds)) {
+      normalized.participantIds.forEach((id) => {
+        if (id != null) {
+          bucket.participantIds.add(id);
+        }
+      });
+    }
+    if (!bucket.branchName && normalized.branchName) {
+      bucket.branchName = normalized.branchName;
+    }
+    if (!bucket.title) {
+      bucket.title = normalized.conversationTitle ?? normalized.subject ?? normalized.taskTitle ?? null;
+    }
+    if (normalized.taskStatus) {
+      bucket.taskStatus = normalized.taskStatus;
+    }
+    const timestamp = new Date(normalized.timestamp).getTime();
+    if (Number.isFinite(timestamp) && (bucket.lastMessageTs === 0 || timestamp >= bucket.lastMessageTs)) {
+      bucket.lastMessageTs = timestamp;
+      bucket.lastMessageAt = new Date(timestamp).toISOString();
+      bucket.previewText = normalized.type === 'task' && normalized.taskDescription
+        ? normalized.taskDescription
+        : normalized.content ?? '';
+    }
+    const readers = Array.isArray(normalized.readBy) ? normalized.readBy : [];
+    const isReadByCurrentUser = normalized.read === true
+      || (currentUserId != null && (readers.includes(currentUserId) || normalized.from === currentUserId));
+    if (!isReadByCurrentUser && currentUserId != null) {
+      bucket.unreadCount += 1;
+    }
+  });
+
+  return Array.from(conversationMap.values()).map((bucket) => {
+    const sortedMessages = bucket.messages
+      .map((message) => ({ ...message }))
+      .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    const messageLookup = new Map(sortedMessages.map((message) => [message.id, message]));
+
+    const enrichedMessages = sortedMessages.map((message) => {
+      const replySource = message.replyToId ? messageLookup.get(message.replyToId) : null;
+      const replyTo = replySource
+        ? {
+            id: replySource.id,
+            content: replySource.content,
+            senderId: replySource.senderId ?? replySource.from ?? null,
+            senderName: getUserDisplayName(userById.get(replySource.senderId ?? replySource.from)),
+          }
+        : null;
+      return {
+        ...message,
+        replyTo,
+        taskActions: deriveTaskActions(message.taskStatus),
+      };
+    });
+
+    const participantIds = Array.from(bucket.participantIds);
+    const participantNames = participantIds
+      .map((id) => getUserDisplayName(userById.get(id)))
+      .filter(Boolean);
+
+    const title = bucket.title
+      ?? (bucket.type === 'branch'
+        ? bucket.branchName ?? 'Branch conversation'
+        : bucket.type === 'task'
+          ? enrichedMessages[0]?.subject ?? enrichedMessages[0]?.taskTitle ?? 'Task conversation'
+          : participantNames.length > 1
+            ? participantNames.join(', ')
+            : participantNames[0] ?? 'Conversation');
+
+    return {
+      id: bucket.id,
+      type: bucket.type,
+      title,
+      branchId: bucket.branchId,
+      branchName: bucket.branchName,
+      participantIds,
+      participantNames,
+      previewText: bucket.previewText,
+      lastMessageAt: bucket.lastMessageAt,
+      unreadCount: bucket.unreadCount,
+      taskStatus: bucket.taskStatus,
+      messages: enrichedMessages,
+    };
+  });
+}
+
+const defaultUsers = [
+  { id: 1, username: 'admin', role: 'admin', name: 'Administrator', email: 'admin@company.com', phone: '+971501234567', address: 'Business Bay, Dubai', hireDate: '2023-01-01', salary: 75000, commission: 0 },
+  { id: 2, username: 'manager', role: 'manager', name: 'John Manager', email: 'manager@company.com', phone: '+971501234568', address: 'Downtown Dubai', hireDate: '2023-02-01', salary: 60000, commission: 0 },
+  { id: 3, username: 'worker', role: 'worker', name: 'Jane Worker', email: 'worker@company.com', phone: '+971501234569', address: 'Dubai Marina', hireDate: '2023-03-01', salary: 45000, commission: 250 },
+  { id: 4, username: 'worker2', role: 'worker', name: 'Bob Worker', email: 'worker2@company.com', phone: '+971501234570', address: 'Dubai Marina', hireDate: '2023-03-02', salary: 45000, commission: 0 },
+  { id: 5, username: 'manager2', role: 'manager', name: 'Sarah Manager', email: 'manager2@company.com', phone: '+971501234571', address: 'Downtown Dubai', hireDate: '2023-02-02', salary: 60000, commission: 0 },
+];
+
+const defaultMessages = [
+  {
+    id: 1,
+    from: 1,
+    to: 3,
+    subject: 'URGENT: Stock Request for Premium Laptops',
+    content: 'Requesting 15 units of Premium Laptop (SKU: LAP001). Current stock is critically low.',
+    type: 'task',
+    category: 'emergency',
+    status: 'pending_worker_approval',
+    conversationId: 'task-1',
+    conversationType: 'task',
+    taskTitle: 'Stock Request',
+    taskDescription: 'Requesting 15 units of Premium Laptop (SKU: LAP001). Current stock is critically low.',
+    participantIds: [1, 3],
+    timestamp: createTimestamp(),
+    read: false,
+    readBy: [1],
+    reactions: [],
+    replyToId: null,
+    requesterId: 2,
+    history: [
+      {
+        user: 'John Manager',
+        action: 'Request Sent',
+        timestamp: createTimestamp(),
+      },
+    ],
+    taskDetails: {
+      productId: 1,
+      requestedStock: 15,
+    },
+  },
+];
+
+const defaultProducts = [
+  { id: 1, name: 'Premium Laptop', price: 1299.99, cost: 800, stock: 25, category: 'Electronics', description: 'High-performance business laptop', sku: 'LAP001', supplier: 'TechCorp', reorderLevel: 5, imageUrl: 'https://via.placeholder.com/150/00d4aa/FFFFFF?text=Laptop' },
+  { id: 2, name: 'Wireless Mouse', price: 49.99, cost: 25, stock: 100, category: 'Accessories', description: 'Ergonomic wireless mouse', sku: 'MOU002', supplier: 'AccessoryPlus', reorderLevel: 20, imageUrl: 'https://via.placeholder.com/150/0ea5e9/FFFFFF?text=Mouse' },
+  { id: 3, name: 'USB-C Hub', price: 79.99, cost: 40, stock: 8, category: 'Accessories', description: '7-in-1 USB-C hub', sku: 'HUB003', supplier: 'ConnectTech', reorderLevel: 10, imageUrl: 'https://via.placeholder.com/150/8b5cf6/FFFFFF?text=USB+Hub' },
+  { id: 4, name: 'External SSD 1TB', price: 150.0, cost: 90, stock: 15, category: 'Storage', description: 'Fast and portable SSD', sku: 'SSD004', supplier: 'DataSolutions', reorderLevel: 5, imageUrl: 'https://via.placeholder.com/150/10b981/FFFFFF?text=SSD' },
+  { id: 5, name: 'Ergonomic Keyboard', price: 99.99, cost: 50, stock: 30, category: 'Peripherals', description: 'Comfortable typing experience', sku: 'KEY005', supplier: 'ErgoGear', reorderLevel: 10, imageUrl: 'https://via.placeholder.com/150/f59e0b/FFFFFF?text=Keyboard' },
+  { id: 6, name: '4K Monitor 27-inch', price: 399.99, cost: 250, stock: 12, category: 'Displays', description: 'Vivid 4K resolution monitor', sku: 'MON006', supplier: 'ViewTech', reorderLevel: 3, imageUrl: 'https://via.placeholder.com/150/ef4444/FFFFFF?text=Monitor' },
+];
+
+const defaultCustomers = [
+  { id: 1, name: 'Emirates Tech Solutions', email: 'contact@emirates-tech.com', phone: '+971501234570', address: 'DIFC, Dubai, UAE', type: 'Business', taxId: 'TRN100123456789012', creditLimit: 50000, balance: 0 },
+  { id: 2, name: 'Ahmed Al Rashid', email: 'ahmed.alrashid@email.com', phone: '+971501234571', address: 'Jumeirah, Dubai, UAE', type: 'Individual', taxId: '', creditLimit: 5000, balance: 0 },
+  { id: 3, name: 'Global Innovations LLC', email: 'info@globalinnovations.com', phone: '+971501234572', address: 'Business Bay, Dubai, UAE', type: 'Business', taxId: 'TRN100123456789013', creditLimit: 75000, balance: 0 },
+  { id: 4, name: 'Fatima Khan', email: 'fatima.k@email.com', phone: '+971501234573', address: 'Al Barsha, Dubai, UAE', type: 'Individual', taxId: '', creditLimit: 10000, balance: 0 },
+];
+
+const defaultSales = [
+  {
+    id: 1,
+    customerId: 1,
+    items: [{ productId: 1, quantity: 2, unitPrice: 1299.99 }],
+    total: 2599.98,
+    date: '2024-01-15',
+    salesPersonId: 3,
+    subtotal: 2599.98,
+    taxAmount: 0,
+    taxRate: 0,
+    saleType: 'Credit',
+    discount: 0,
+  },
+];
+const defaultInvoices = [
+  {
+    id: 1,
+    invoiceNumber: 'INV-1001',
+    customerId: 1,
+    issuedBy: 3,
+    date: '2024-01-18',
+    dueDate: '2024-02-02',
+    status: 'sent',
+    currencyCode: 'AED',
+    subtotal: 2599.98,
+    discount: 0,
+    taxRate: 0.05,
+    taxAmount: 130,
+    total: 2729.98,
+    balanceDue: 2729.98,
+    notes: 'Payment due within 15 days of invoice date.',
+    items: [
+      { description: 'Premium Laptop', quantity: 2, unitPrice: 1299.99 },
+    ],
+  },
+  {
+    id: 2,
+    invoiceNumber: 'INV-1002',
+    customerId: 2,
+    issuedBy: 2,
+    date: '2024-02-05',
+    dueDate: '2024-02-20',
+    status: 'paid',
+    currencyCode: 'AED',
+    subtotal: 1499.99,
+    discount: 50,
+    taxRate: 0.05,
+    taxAmount: 72.5,
+    total: 1522.49,
+    balanceDue: 0,
+    notes: 'Settled via bank transfer.',
+    items: [
+      { description: '4K Monitor 27-inch', quantity: 1, unitPrice: 399.99 },
+      { description: 'Wireless Mouse', quantity: 2, unitPrice: 49.99 },
+      { description: 'USB-C Hub', quantity: 1, unitPrice: 79.99 },
+    ],
+  },
+  {
+    id: 3,
+    invoiceNumber: 'INV-1003',
+    customerId: 3,
+    issuedBy: 1,
+    date: '2024-02-10',
+    dueDate: '2024-02-25',
+    status: 'overdue',
+    currencyCode: 'AED',
+    subtotal: 3250,
+    discount: 0,
+    taxRate: 0.05,
+    taxAmount: 162.5,
+    total: 3412.5,
+    balanceDue: 3412.5,
+    notes: 'Reminder sent on 2024-02-20.',
+    items: [
+      { description: 'Enterprise Support Package', quantity: 1, unitPrice: 1800 },
+      { description: 'On-site Training', quantity: 1, unitPrice: 1450 },
+    ],
+  },
+];
+
+const defaultExpenses = [
+  { id: 1, description: 'Office Rent', amount: 5000, category: '6110', date: '2024-01-01', addedBy: 1, notes: 'Monthly office rent payment' },
+];
+
+
+function getNextInvoiceId(invoices) {
+  if (!Array.isArray(invoices) || !invoices.length) {
+    return 1;
+  }
+  const numericIds = invoices
+    .map((invoice) => Number(invoice?.id))
+    .filter((value) => Number.isFinite(value));
+  if (!numericIds.length) {
+    return invoices.length + 1;
+  }
+  return Math.max(...numericIds) + 1;
+}
+
+function normalizeDateInput(value, offsetDays = 0) {
+  const base = value ? new Date(value) : new Date();
+  if (Number.isNaN(base.getTime())) {
+    const fallback = new Date();
+    if (offsetDays) {
+      fallback.setDate(fallback.getDate() + offsetDays);
+    }
+    return fallback.toISOString().slice(0, 10);
+  }
+  if (offsetDays) {
+    base.setDate(base.getDate() + offsetDays);
+  }
+  return base.toISOString().slice(0, 10);
+}
+
+function createInvoiceFromSale(sale, state) {
+  if (!sale) return null;
+  const invoiceId = getNextInvoiceId(state.invoices);
+  const customer = state.customers.find((entry) => entry.id === sale.customerId) ?? null;
+  const items = (sale.items ?? []).map((item) => {
+    const product = state.products.find((productItem) => productItem.id === item.productId);
+    return {
+      description: product?.name ?? item.description ?? 'Line item',
+      quantity: item.quantity ?? 0,
+      unitPrice: item.unitPrice ?? 0,
+    };
+  });
+  const subtotal = sale.subtotal ?? items.reduce((sum, item) => sum + (item.quantity ?? 0) * (item.unitPrice ?? 0), 0);
+  const discount = sale.discount ?? 0;
+  const taxRate = sale.taxRate ?? 0;
+  const taxAmount = sale.taxAmount ?? subtotal * taxRate;
+  const total = sale.total ?? subtotal - discount + taxAmount;
+  const status = (sale.saleType ?? 'credit').toLowerCase() === 'cash' ? 'paid' : 'sent';
+  const balanceDue = status === 'paid' ? 0 : total;
+  const invoiceNumber = sale.invoiceNumber ?? `INV-${String(invoiceId).padStart(4, '0')}`;
+  return {
+    id: invoiceId,
+    invoiceNumber,
+    customerId: sale.customerId ?? null,
+    customer: customer ? { ...customer } : undefined,
+    issuedBy: sale.salesPersonId ?? state.currentUser?.id ?? null,
+    issuedByUser: state.users.find((user) => user.id === (sale.salesPersonId ?? state.currentUser?.id ?? null)) ?? null,
+    date: normalizeDateInput(sale.date),
+    dueDate: sale.dueDate ?? normalizeDateInput(sale.date, 14),
+    status,
+    currencyCode: state.selectedCountry,
+    subtotal,
+    discount,
+    taxRate,
+    taxAmount,
+    total,
+    balanceDue,
+    notes: sale.notes ?? `Invoice generated from sale #${sale.id ?? invoiceId}.`,
+    items,
+  };
+}
+
+function createInvoiceFromExpense(expense, state) {
+  if (!expense || typeof expense.amount !== 'number') return null;
+  const invoiceId = getNextInvoiceId(state.invoices);
+  const amount = expense.amount ?? 0;
+  const issuedByUser = state.users.find((user) => user.id === expense.addedBy) ?? null;
+  return {
+    id: invoiceId,
+    invoiceNumber: `EXP-${String(invoiceId).padStart(4, '0')}`,
+    customerId: null,
+    customer: { name: `Expense - ${expense.description ?? 'General'}` },
+    issuedBy: expense.addedBy ?? state.currentUser?.id ?? null,
+    issuedByUser,
+    date: normalizeDateInput(expense.date),
+    dueDate: normalizeDateInput(expense.date),
+    status: 'paid',
+    currencyCode: state.selectedCountry,
+    subtotal: amount,
+    discount: 0,
+    taxRate: 0,
+    taxAmount: 0,
+    total: amount,
+    balanceDue: 0,
+    notes: expense.notes ?? `Expense recorded under ${expense.category ?? 'general ledger'}.`,
+    items: [
+      { description: expense.description ?? 'Expense', quantity: 1, unitPrice: amount },
+    ],
+  };
+}
+const defaultBranches = [
+  { id: 1, name: 'Management Team', members: [1, 2] },
+  { id: 2, name: 'Sales Floor', members: [3] },
+];
+
+const defaultTasks = [
+  {
+    id: 1704445200000,
+    title: 'Q1 Revenue Sprint',
+    description: 'Drive AED 120,000 in revenue before the quarter closes.',
+    dueDate: '2024-03-31',
+    createdBy: 2,
+    goalType: 'sales',
+    goalTarget: 120000,
+    participantLimit: 4,
+    accuraBotEnabled: true,
+    accuraBotReportFrequency: 'weekly',
+    branchId: 2,
+    progress: 64000,
+    participants: [2, 3],
+    status: 'active',
+    isSubTask: false,
+    parentTaskId: null,
+    lastNotifiedProgress: 50,
+    createdAt: '2024-01-05T09:00:00.000Z',
+  },
+  {
+    id: 1704445260000,
+    title: 'Q1 Revenue Sprint (Personal Goal)',
+    description: 'Personal contribution plan for John Manager on "Q1 Revenue Sprint".',
+    dueDate: '2024-03-31',
+    createdBy: 2,
+    goalType: 'sales',
+    goalTarget: 40000,
+    participantLimit: 1,
+    accuraBotEnabled: false,
+    accuraBotReportFrequency: null,
+    branchId: 2,
+    progress: 36000,
+    participants: [2],
+    status: 'active',
+    isSubTask: true,
+    parentTaskId: 1704445200000,
+    lastNotifiedProgress: 75,
+    createdAt: '2024-01-05T09:01:00.000Z',
+  },
+  {
+    id: 1704445320000,
+    title: 'Q1 Revenue Sprint (Personal Goal)',
+    description: 'Personal contribution plan for Jane Worker on "Q1 Revenue Sprint".',
+    dueDate: '2024-03-31',
+    createdBy: 2,
+    goalType: 'sales',
+    goalTarget: 30000,
+    participantLimit: 1,
+    accuraBotEnabled: false,
+    accuraBotReportFrequency: null,
+    branchId: 2,
+    progress: 24000,
+    participants: [3],
+    status: 'active',
+    isSubTask: true,
+    parentTaskId: 1704445200000,
+    lastNotifiedProgress: 50,
+    createdAt: '2024-01-05T09:02:00.000Z',
+  },
+  {
+    id: 1706778000000,
+    title: 'Flagship Launch Playbook',
+    description: 'Coordinate the new flagship product launch across management and sales teams.',
+    dueDate: '2024-04-15',
+    createdBy: 1,
+    goalType: 'count',
+    goalTarget: 10,
+    participantLimit: 3,
+    accuraBotEnabled: true,
+    accuraBotReportFrequency: 'end_of_task',
+    branchId: 1,
+    progress: 4,
+    participants: [1, 2],
+    status: 'active',
+    isSubTask: false,
+    parentTaskId: null,
+    lastNotifiedProgress: 25,
+    createdAt: '2024-02-01T09:00:00.000Z',
+  },
+  {
+    id: 1706778060000,
+    title: 'Flagship Launch (Personal Goal)',
+    description: 'Personal checklist for Administrator on "Flagship Launch Playbook".',
+    dueDate: '2024-04-15',
+    createdBy: 1,
+    goalType: 'count',
+    goalTarget: 5,
+    participantLimit: 1,
+    accuraBotEnabled: false,
+    accuraBotReportFrequency: null,
+    branchId: 1,
+    progress: 2,
+    participants: [1],
+    status: 'active',
+    isSubTask: true,
+    parentTaskId: 1706778000000,
+    lastNotifiedProgress: 0,
+    createdAt: '2024-02-01T09:01:00.000Z',
+  },
+  {
+    id: 1706778120000,
+    title: 'Flagship Launch (Personal Goal)',
+    description: 'Personal checklist for John Manager on "Flagship Launch Playbook".',
+    dueDate: '2024-04-15',
+    createdBy: 1,
+    goalType: 'count',
+    goalTarget: 5,
+    participantLimit: 1,
+    accuraBotEnabled: false,
+    accuraBotReportFrequency: null,
+    branchId: 1,
+    progress: 2,
+    participants: [2],
+    status: 'active',
+    isSubTask: true,
+    parentTaskId: 1706778000000,
+    lastNotifiedProgress: 0,
+    createdAt: '2024-02-01T09:02:00.000Z',
+  },
+  {
+    id: 1709370000000,
+    title: 'Margin Mission',
+    description: 'Improve profit margin by AED 40,000 through upsells and services.',
+    dueDate: '2024-05-31',
+    createdBy: 2,
+    goalType: 'profit',
+    goalTarget: 40000,
+    participantLimit: 2,
+    accuraBotEnabled: true,
+    accuraBotReportFrequency: 'weekly',
+    branchId: 2,
+    progress: 15000,
+    participants: [2],
+    status: 'active',
+    isSubTask: false,
+    parentTaskId: null,
+    lastNotifiedProgress: 0,
+    createdAt: '2024-03-02T09:00:00.000Z',
+  },
+  {
+    id: 1709370060000,
+    title: 'Margin Mission (Personal Goal)',
+    description: 'Personal profit contribution goal for John Manager on "Margin Mission".',
+    dueDate: '2024-05-31',
+    createdBy: 2,
+    goalType: 'profit',
+    goalTarget: 20000,
+    participantLimit: 1,
+    accuraBotEnabled: false,
+    accuraBotReportFrequency: null,
+    branchId: 2,
+    progress: 15000,
+    participants: [2],
+    status: 'active',
+    isSubTask: true,
+    parentTaskId: 1709370000000,
+    lastNotifiedProgress: 0,
+    createdAt: '2024-03-02T09:01:00.000Z',
+  },
+];
+
+const TASK_PROGRESS_MILESTONES = [25, 50, 75, 100];
+
+function getPerParticipantTarget(goalType, goalTarget, participantLimit) {
+  if (!Number.isFinite(goalTarget) || goalTarget <= 0) {
+    return 0;
+  }
+  if (!Number.isFinite(participantLimit) || participantLimit <= 0) {
+    return goalTarget;
+  }
+  if (goalType === 'count') {
+    return Math.max(1, Math.ceil(goalTarget / participantLimit));
+  }
+  return goalTarget / participantLimit;
+}
+
+function createPersonalTask(mainTask, userId, users, timestamp = Date.now()) {
+  const personalGoalTarget = getPerParticipantTarget(mainTask.goalType, mainTask.goalTarget, mainTask.participantLimit);
+  const user = Array.isArray(users) ? users.find((candidate) => candidate.id === userId) : null;
+  const userName = user?.name?.split(' ')[0] ?? 'Team member';
+  return {
+    id: timestamp + userId,
+    title: `${mainTask.title} (Personal Goal)`,
+    description: `Personal contribution plan for ${userName} on "${mainTask.title}".`,
+    dueDate: mainTask.dueDate,
+    createdBy: mainTask.createdBy,
+    goalType: mainTask.goalType,
+    goalTarget: personalGoalTarget,
+    participantLimit: 1,
+    accuraBotEnabled: false,
+    accuraBotReportFrequency: null,
+    branchId: mainTask.branchId ?? null,
+    progress: 0,
+    participants: [userId],
+    status: 'active',
+    isSubTask: true,
+    parentTaskId: mainTask.id,
+    lastNotifiedProgress: 0,
+    createdAt: new Date(timestamp).toISOString(),
+  };
+}
+
+function recalculatePersonalTargets(tasks, mainTask) {
+  const perParticipantTarget = getPerParticipantTarget(mainTask.goalType, mainTask.goalTarget, mainTask.participantLimit);
+  return tasks.map((task) => {
+    if (task.parentTaskId !== mainTask.id) {
+      return task;
+    }
+    const next = {
+      ...task,
+      goalType: mainTask.goalType,
+      goalTarget: perParticipantTarget,
+      dueDate: mainTask.dueDate,
+      branchId: mainTask.branchId ?? null,
+    };
+    if (next.progress >= next.goalTarget && next.status !== 'completed') {
+      next.status = 'completed';
+    }
+    return next;
+  });
+}
+
+function computeSaleProfit(sale, products) {
+  if (!sale || !Array.isArray(sale.items)) {
+    return 0;
+  }
+  const totalCost = sale.items.reduce((sum, item) => {
+    const product = Array.isArray(products) ? products.find((candidate) => candidate.id === item.productId) : null;
+    const productCost = Number(product?.cost) || 0;
+    const quantity = Number(item?.quantity) || 0;
+    return sum + productCost * quantity;
+  }, 0);
+  const subtotal = Number(sale.subtotal) || 0;
+  const discount = Number(sale.discount) || 0;
+  const revenue = subtotal - discount;
+  const profit = revenue - totalCost;
+  return profit > 0 ? profit : 0;
+}
+
+function computeProgressDelta(goalType, sale, profit) {
+  if (goalType === 'sales') {
+    return Number(sale?.total) || 0;
+  }
+  if (goalType === 'profit') {
+    return profit;
+  }
+  if (goalType === 'count') {
+    return 1;
+  }
+  return 0;
+}
+
+function buildTaskMilestoneNotification(task, milestone) {
+  const completed = milestone >= 100;
+  return createNotification({
+    message: completed ? `Task completed: ${task.title}` : `${task.title} reached ${milestone}% progress`,
+    description: completed
+      ? 'AccuraBot closed out this objective.'
+      : 'AccuraBot milestone update.',
+    type: completed ? 'success' : 'info',
+    duration: 6000,
+  });
+}
+
+function ensureNotificationId(notification) {
+  if (notification.id != null) {
+    return notification;
+  }
+  return {
+    ...notification,
+    id: `note-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+  };
+}
+
+function applySaleToTasks(state, sale) {
+  const salespersonId = Number(sale?.salesPersonId);
+  if (!Number.isFinite(salespersonId)) {
+    return { tasks: state.tasks, notifications: [] };
+  }
+
+  const activeSubTasks = state.tasks.filter(
+    (task) => task.isSubTask && task.status === 'active' && task.participants.includes(salespersonId),
+  );
+  if (!activeSubTasks.length) {
+    return { tasks: state.tasks, notifications: [] };
+  }
+
+  const profit = computeSaleProfit(sale, state.products);
+  const nextTasks = state.tasks.map((task) => ({ ...task }));
+  const notifications = [];
+
+  activeSubTasks.forEach((subTask) => {
+    const subIndex = nextTasks.findIndex((task) => task.id === subTask.id);
+    if (subIndex === -1) {
+      return;
+    }
+
+    const progressDelta = computeProgressDelta(subTask.goalType, sale, profit);
+    if (progressDelta <= 0) {
+      return;
+    }
+
+    const updatedSub = nextTasks[subIndex];
+    updatedSub.progress += progressDelta;
+
+    if (updatedSub.progress >= updatedSub.goalTarget && updatedSub.status !== 'completed') {
+      updatedSub.status = 'completed';
+    }
+
+    if (!updatedSub.parentTaskId) {
+      return;
+    }
+
+    const parentIndex = nextTasks.findIndex((task) => task.id === updatedSub.parentTaskId);
+    if (parentIndex === -1) {
+      return;
+    }
+
+    const updatedMain = nextTasks[parentIndex];
+    updatedMain.progress += progressDelta;
+
+    const progressPercentage = updatedMain.goalTarget > 0
+      ? (updatedMain.progress / updatedMain.goalTarget) * 100
+      : 0;
+
+    if (progressPercentage >= 100 && updatedMain.status !== 'completed') {
+      updatedMain.status = 'completed';
+      if (updatedMain.accuraBotEnabled) {
+        notifications.push(buildTaskMilestoneNotification(updatedMain, 100));
+        updatedMain.lastNotifiedProgress = 100;
+      }
+    } else if (updatedMain.accuraBotEnabled) {
+      const milestone = TASK_PROGRESS_MILESTONES.find(
+        (mark) => mark < 100
+          && progressPercentage >= mark
+          && (updatedMain.lastNotifiedProgress ?? 0) < mark,
+      );
+      if (milestone != null) {
+        notifications.push(buildTaskMilestoneNotification(updatedMain, milestone));
+        updatedMain.lastNotifiedProgress = milestone;
+      }
+    }
+
+    if (updatedSub.status === 'completed') {
+      const siblingSubTasks = nextTasks.filter(
+        (task) => task.parentTaskId === updatedSub.parentTaskId,
+      );
+      if (siblingSubTasks.length > 0 && siblingSubTasks.every((task) => task.status === 'completed')) {
+        if (updatedMain.status !== 'completed') {
+          updatedMain.status = 'completed';
+          if (updatedMain.accuraBotEnabled && updatedMain.lastNotifiedProgress !== 100) {
+            notifications.push(buildTaskMilestoneNotification(updatedMain, 100));
+            updatedMain.lastNotifiedProgress = 100;
+          }
+        }
+      }
+    }
+  });
+
+  return {
+    tasks: nextTasks,
+    notifications,
+  };
+}
+
+const chartOfAccounts = [
+  { code: '1110', name: 'Cash on Hand', type: 'Asset', normalBalance: 'Debit' },
+  { code: '1120', name: 'Accounts Receivable', type: 'Asset', normalBalance: 'Debit' },
+  { code: '1210', name: 'Inventory Asset', type: 'Asset', normalBalance: 'Debit' },
+  { code: '1310', name: 'Prepaid Expenses', type: 'Asset', normalBalance: 'Debit' },
+  { code: '1410', name: 'Property, Plant, & Equipment', type: 'Asset', normalBalance: 'Debit' },
+  { code: '2110', name: 'Accounts Payable', type: 'Liability', normalBalance: 'Credit' },
+  { code: '2210', name: 'VAT Payable', type: 'Liability', normalBalance: 'Credit' },
+  { code: '2310', name: 'Salaries Payable', type: 'Liability', normalBalance: 'Credit' },
+  { code: '3110', name: "Owner's Equity", type: 'Equity', normalBalance: 'Credit' },
+  { code: '3210', name: 'Retained Earnings', type: 'Equity', normalBalance: 'Credit' },
+  { code: '4110', name: 'Sales Revenue', type: 'Revenue', normalBalance: 'Credit' },
+  { code: '4120', name: 'Sales Discount', type: 'Contra-Revenue', normalBalance: 'Debit' },
+  { code: '5110', name: 'Cost of Goods Sold', type: 'COGS', normalBalance: 'Debit' },
+  { code: '6110', name: 'Rent Expense', type: 'Expense', normalBalance: 'Debit' },
+  { code: '6120', name: 'Salaries Expense', type: 'Expense', normalBalance: 'Debit' },
+  { code: '6130', name: 'Office Supplies Expense', type: 'Expense', normalBalance: 'Debit' },
+  { code: '6140', name: 'Marketing Expense', type: 'Expense', normalBalance: 'Debit' },
+  { code: '6150', name: 'Utilities Expense', type: 'Expense', normalBalance: 'Debit' },
+  { code: '6160', name: 'Transportation Expense', type: 'Expense', normalBalance: 'Debit' },
+  { code: '6170', name: 'Meals & Entertainment Expense', type: 'Expense', normalBalance: 'Debit' },
+  { code: '6180', name: 'Equipment Expense', type: 'Expense', normalBalance: 'Debit' },
+  { code: '6190', name: 'Professional Services Expense', type: 'Expense', normalBalance: 'Debit' },
+  { code: '6200', name: 'Other Expense', type: 'Expense', normalBalance: 'Debit' },
+];
+const defaultJournal = buildInitialJournal({ sales: defaultSales, expenses: defaultExpenses, products: defaultProducts, customers: defaultCustomers, chartOfAccounts });
+
+const AppStateContext = createContext(null);
+const AppActionsContext = createContext(null);
+
+const quickSaleInitialState = {
+  active: false,
+  currentStep: 1,
+  selectedProductIds: [],
+  productQuantities: {},
+  selectedCustomerId: null,
+  paymentType: 'Cash',
+  discount: 0,
+  subtotal: 0,
+  taxAmount: 0,
+  total: 0,
+};
+const initialAppState = {
+  serverUrl: 'https://ledgerly-backend-e8au.onrender.com',
+  charts: {},
+  currentSaleCart: [],
+  theme: 'dark-theme',
+  currentView: 'login',
+  pendingRole: null,
+  currentUser: null,
+  mobileMenuOpen: false,
+  aiMode: 'ai',
+  aiLoading: false,
+  aiAnswer: null,
+  pixelAnimation: null,
+  aiChatHistory: [],
+  aiAudioPlayers: {},
+  aiSettings: {
+    language: 'English',
+    highlightKeywords: false,
+    highlightNumbers: false,
+  },
+  selectedCountry: defaultCountryCode,
+  companyName: 'Your Company',
+  lowStockThreshold: 10,
+  users: defaultUsers,
+  products: defaultProducts,
+  customers: defaultCustomers,
+  sales: defaultSales,
+  expenses: defaultExpenses,
+  invoices: defaultInvoices,
+  messages: defaultMessages,
+  branches: defaultBranches,
+  activeConversationId: null,
+  inboxFilter: 'all',
+  taskFilter: 'all',
+  inboxSearchTerm: '',
+  categories: ['Electronics', 'Accessories', 'Software', 'Services', 'Storage', 'Peripherals', 'Displays', 'Other'],
+  expenseCategories: ['Office Supplies', 'Marketing', 'Utilities', 'Rent', 'Transportation', 'Meals & Entertainment', 'Equipment', 'Professional Services', 'Other'],
+  aiInsights: [],
+  botAnalysis: {},
+  lastAIUpdate: null,
+  quickSale: { ...quickSaleInitialState },
+  aiViewPhase: 'selection',
+  currentAICategory: null,
+  currentAICategoryText: null,
+  journal: defaultJournal,
+  currentBranchId: null,
+  tasks: defaultTasks,
+  announcements: [],
+  chartOfAccounts,
+  notifications: [],
+  modal: { open: false, content: null, props: null },
+};
+
+function appReducer(state, action) {
+  switch (action.type) {
+    case 'HYDRATE_STATE': {
+      const payload = action.payload ?? {};
+      const mergedQuickSale = {
+        ...quickSaleInitialState,
+        ...(payload.quickSale ?? {}),
+        active: false,
+      };
+      return {
+        ...state,
+        ...payload,
+        quickSale: mergedQuickSale,
+        mobileMenuOpen: false,
+        aiLoading: false,
+        aiAnswer: null,
+        pixelAnimation: null,
+        notifications: state.notifications,
+        modal: state.modal,
+      };
+    }
+    case 'SET_VIEW':
+      return { ...state, currentView: action.payload };
+    case 'SET_PENDING_ROLE':
+      return { ...state, pendingRole: action.payload };
+    case 'LOGIN':
+      return {
+        ...state,
+        currentUser: action.payload.user,
+        currentView: action.payload.nextView ?? 'dashboard',
+        pendingRole: null,
+        mobileMenuOpen: false,
+      };
+    case 'LOGOUT':
+      return {
+        ...state,
+        currentUser: null,
+        currentView: 'login',
+        pendingRole: null,
+        mobileMenuOpen: false,
+        quickSale: { ...quickSaleInitialState },
+      };
+    case 'SET_USERS':
+      return { ...state, users: Array.isArray(action.payload) ? action.payload : state.users };
+    case 'ADD_EMPLOYEE': {
+      const employee = action.payload;
+      if (!employee || employee.id == null) {
+        return state;
+      }
+      const identifier = String(employee.id);
+      if (state.users.some((user) => String(user?.id) === identifier)) {
+        return state;
+      }
+      return { ...state, users: [...state.users, employee] };
+    }
+    case 'UPDATE_EMPLOYEE': {
+      const employee = action.payload;
+      if (!employee || employee.id == null) {
+        return state;
+      }
+      const identifier = String(employee.id);
+      const index = state.users.findIndex((user) => String(user?.id) === identifier);
+      if (index === -1) {
+        return state;
+      }
+      const previous = state.users[index];
+      const preservedCommission = employee.commission != null ? employee.commission : previous.commission ?? 0;
+      const updatedEmployee = {
+        ...previous,
+        ...employee,
+        commission: preservedCommission,
+      };
+      const nextUsers = state.users.slice();
+      nextUsers[index] = updatedEmployee;
+      const isCurrentUser = String(state.currentUser?.id ?? '') === identifier;
+      return {
+        ...state,
+        users: nextUsers,
+        currentUser: isCurrentUser ? { ...state.currentUser, ...updatedEmployee } : state.currentUser,
+      };
+    }
+    case 'DELETE_EMPLOYEE': {
+      const targetId = action.payload;
+      if (targetId == null) {
+        return state;
+      }
+      const identifier = String(targetId);
+      const nextUsers = state.users.filter((user) => String(user?.id) !== identifier);
+      if (nextUsers.length === state.users.length) {
+        return state;
+      }
+      const isCurrentUser = String(state.currentUser?.id ?? '') === identifier;
+      const baseState = {
+        ...state,
+        users: nextUsers,
+      };
+      if (!isCurrentUser) {
+        return baseState;
+      }
+      return {
+        ...baseState,
+        currentUser: null,
+        currentView: 'login',
+        pendingRole: null,
+        mobileMenuOpen: false,
+        quickSale: { ...quickSaleInitialState },
+      };
+    }
+    case 'TOGGLE_MOBILE_MENU':
+      return { ...state, mobileMenuOpen: !state.mobileMenuOpen };
+    case 'SET_MOBILE_MENU':
+      return { ...state, mobileMenuOpen: Boolean(action.payload) };
+    case 'SET_THEME':
+      return { ...state, theme: action.payload };
+    case 'SET_AI_MODE':
+      return { ...state, aiMode: action.payload };
+    case 'SET_BOT_ANALYSIS':
+      return { ...state, botAnalysis: action.payload ?? {} };
+    case 'SET_SELECTED_COUNTRY':
+      return { ...state, selectedCountry: action.payload };
+    case 'SET_COMPANY_NAME':
+      return { ...state, companyName: action.payload };
+    case 'SET_LOW_STOCK_THRESHOLD':
+      return {
+        ...state,
+        lowStockThreshold: Number.isFinite(action.payload) ? action.payload : state.lowStockThreshold,
+      };
+    case 'SET_TASK_FILTER':
+      return { ...state, taskFilter: action.payload ?? state.taskFilter };
+    case 'CREATE_TASK': {
+      const payload = action.payload ?? {};
+      const taskInput = payload.task ?? null;
+      const creatorId = Number(payload.creatorId);
+      if (!taskInput || !Number.isFinite(creatorId)) {
+        return state;
+      }
+      const timestamp = Number.isFinite(taskInput.id) ? taskInput.id : Date.now();
+      const createdAt = taskInput.createdAt ?? new Date(timestamp).toISOString();
+      const normalizedGoalTarget = Number.isFinite(Number(taskInput.goalTarget))
+        ? Number(taskInput.goalTarget)
+        : 0;
+      const normalizedParticipantLimit = Number.isFinite(Number(taskInput.participantLimit))
+        && Number(taskInput.participantLimit) > 0
+        ? Number(taskInput.participantLimit)
+        : 1;
+      const normalizedMainTask = {
+        ...taskInput,
+        id: timestamp,
+        createdAt,
+        createdBy: creatorId,
+        goalTarget: normalizedGoalTarget,
+        participantLimit: normalizedParticipantLimit,
+        branchId: taskInput.branchId ?? null,
+        accuraBotEnabled: Boolean(taskInput.accuraBotEnabled),
+        accuraBotReportFrequency: taskInput.accuraBotEnabled
+          ? taskInput.accuraBotReportFrequency ?? 'weekly'
+          : null,
+        progress: 0,
+        status: 'active',
+        isSubTask: false,
+        parentTaskId: null,
+        lastNotifiedProgress: 0,
+        participants: [creatorId],
+      };
+      const personalTask = createPersonalTask(normalizedMainTask, creatorId, state.users, timestamp + 1);
+      return {
+        ...state,
+        tasks: [...state.tasks, normalizedMainTask, personalTask],
+      };
+    }
+    case 'UPDATE_TASK': {
+      const payload = action.payload ?? {};
+      if (payload.id == null) {
+        return state;
+      }
+      const index = state.tasks.findIndex((task) => task.id === payload.id);
+      if (index === -1) {
+        return state;
+      }
+      const existingTask = state.tasks[index];
+      const updatedTask = {
+        ...existingTask,
+        ...payload,
+      };
+      let nextTasks = state.tasks.slice();
+      if (!updatedTask.isSubTask) {
+        const goalTarget = Number(updatedTask.goalTarget);
+        const participantLimit = Number(updatedTask.participantLimit);
+        updatedTask.goalTarget = Number.isFinite(goalTarget) ? goalTarget : existingTask.goalTarget;
+        updatedTask.participantLimit = Number.isFinite(participantLimit) && participantLimit > 0
+          ? participantLimit
+          : existingTask.participantLimit;
+        updatedTask.accuraBotEnabled = Boolean(updatedTask.accuraBotEnabled);
+        updatedTask.accuraBotReportFrequency = updatedTask.accuraBotEnabled
+          ? updatedTask.accuraBotReportFrequency ?? 'weekly'
+          : null;
+        if (!updatedTask.accuraBotEnabled) {
+          updatedTask.lastNotifiedProgress = 0;
+        }
+      }
+      nextTasks[index] = updatedTask;
+      if (!updatedTask.isSubTask) {
+        nextTasks = recalculatePersonalTargets(nextTasks, updatedTask);
+      }
+      return {
+        ...state,
+        tasks: nextTasks,
+      };
+    }
+    case 'DELETE_TASK': {
+      const taskId = Number(action.payload);
+      if (!Number.isFinite(taskId)) {
+        return state;
+      }
+      const targetTask = state.tasks.find((task) => task.id === taskId);
+      if (!targetTask) {
+        return state;
+      }
+      let nextTasks = state.tasks.filter(
+        (task) => task.id !== taskId && task.parentTaskId !== taskId,
+      );
+      if (targetTask.isSubTask && targetTask.parentTaskId != null) {
+        const mainIndex = nextTasks.findIndex((task) => task.id === targetTask.parentTaskId);
+        if (mainIndex !== -1) {
+          const mainTask = { ...nextTasks[mainIndex] };
+          if (Array.isArray(mainTask.participants)) {
+            const participantId = Array.isArray(targetTask.participants) ? targetTask.participants[0] : null;
+            if (participantId != null) {
+              mainTask.participants = mainTask.participants.filter((id) => id !== participantId);
+            }
+          }
+          nextTasks = [
+            ...nextTasks.slice(0, mainIndex),
+            mainTask,
+            ...nextTasks.slice(mainIndex + 1),
+          ];
+        }
+      }
+      return {
+        ...state,
+        tasks: nextTasks,
+      };
+    }
+    case 'JOIN_TASK': {
+      const numericTaskId = Number(action.payload?.taskId);
+      const numericUserId = Number(action.payload?.userId);
+      if (!Number.isFinite(numericTaskId) || !Number.isFinite(numericUserId)) {
+        return state;
+      }
+      const taskIndex = state.tasks.findIndex((task) => task.id === numericTaskId && !task.isSubTask);
+      if (taskIndex === -1) {
+        return state;
+      }
+      const mainTask = state.tasks[taskIndex];
+      if (mainTask.participants.includes(numericUserId) || mainTask.participants.length >= mainTask.participantLimit) {
+        return state;
+      }
+      const updatedMain = {
+        ...mainTask,
+        participants: [...mainTask.participants, numericUserId],
+      };
+      const timestamp = Date.now();
+      const personalTask = createPersonalTask(updatedMain, numericUserId, state.users, timestamp);
+      let nextTasks = state.tasks.slice();
+      nextTasks[taskIndex] = updatedMain;
+      nextTasks = [...nextTasks, personalTask];
+      nextTasks = recalculatePersonalTargets(nextTasks, updatedMain);
+      return {
+        ...state,
+        tasks: nextTasks,
+      };
+    }
+    case 'ASSIGN_TASK_TO_BRANCH': {
+      const numericTaskId = Number(action.payload?.taskId);
+      const branchIdRaw = action.payload?.branchId;
+      const normalizedBranchId = branchIdRaw == null ? null : Number(branchIdRaw);
+      if (!Number.isFinite(numericTaskId)) {
+        return state;
+      }
+      let changed = false;
+      const nextTasks = state.tasks.map((task) => {
+        if (task.id === numericTaskId) {
+          changed = true;
+          return { ...task, branchId: normalizedBranchId };
+        }
+        if (task.parentTaskId === numericTaskId) {
+          changed = true;
+          return { ...task, branchId: normalizedBranchId };
+        }
+        return task;
+      });
+      if (!changed) {
+        return state;
+      }
+      return {
+        ...state,
+        tasks: nextTasks,
+      };
+    }
+
+
+    case 'SET_QUICK_SALE_ACTIVE': {
+      if (action.payload) {
+        return { ...state, quickSale: { ...quickSaleInitialState, active: true } };
+      }
+      return { ...state, quickSale: { ...quickSaleInitialState } };
+    }
+    case 'UPDATE_QUICK_SALE':
+      return {
+        ...state,
+        quickSale: { ...state.quickSale, ...(action.payload ?? {}) },
+      };
+    case 'FINALIZE_QUICK_SALE':
+      return {
+        ...state,
+        sales: [...state.sales, action.payload.sale],
+        products: action.payload.updatedProducts,
+        quickSale: { ...quickSaleInitialState },
+      };
+    case 'ADD_PRODUCT': {
+      const newProduct = action.payload;
+      const categories = newProduct.category && !state.categories.includes(newProduct.category)
+        ? [...state.categories, newProduct.category]
+        : state.categories;
+      return {
+        ...state,
+        products: [...state.products, newProduct],
+        categories,
+      };
+    }
+    case 'UPDATE_PRODUCT': {
+      const updatedProduct = action.payload;
+      const categories = updatedProduct.category && !state.categories.includes(updatedProduct.category)
+        ? [...state.categories, updatedProduct.category]
+        : state.categories;
+      return {
+        ...state,
+        products: state.products.map((product) => (product.id === updatedProduct.id ? updatedProduct : product)),
+        categories,
+      };
+    }
+    case 'DELETE_PRODUCT':
+      return {
+        ...state,
+        products: state.products.filter((product) => product.id !== action.payload),
+      };
+    case 'ADD_CUSTOMER':
+      return {
+        ...state,
+        customers: [...state.customers, action.payload],
+      };
+    case 'UPDATE_CUSTOMER':
+      return {
+        ...state,
+        customers: state.customers.map((customer) => (customer.id === action.payload.id ? action.payload : customer)),
+      };
+    case 'DELETE_CUSTOMER':
+      return {
+        ...state,
+        customers: state.customers.filter((customer) => customer.id !== action.payload),
+      };
+    case 'ADD_INVOICE':
+      return {
+        ...state,
+        invoices: [...state.invoices, action.payload],
+      };
+    case 'UPDATE_INVOICE':
+      return {
+        ...state,
+        invoices: state.invoices.map((invoice) => (invoice.id === action.payload.id ? { ...invoice, ...action.payload } : invoice)),
+      };
+    case 'DELETE_INVOICE':
+      return {
+        ...state,
+        invoices: state.invoices.filter((invoice) => invoice.id !== action.payload),
+      };
+    case 'ADD_EXPENSE': {
+      const newExpense = action.payload;
+      const categories = newExpense?.category && !state.expenseCategories.includes(newExpense.category)
+        ? [...state.expenseCategories, newExpense.category]
+        : state.expenseCategories;
+      const expenseInvoice = createInvoiceFromExpense(newExpense, state);
+      const expenseJournalEntry = buildExpenseJournalEntry(newExpense, chartOfAccounts);
+      const journal = expenseJournalEntry
+        ? replaceJournalEntries(state.journal, [expenseJournalEntry])
+        : state.journal;
+      return {
+        ...state,
+        expenses: [...state.expenses, newExpense],
+        expenseCategories: categories,
+        invoices: expenseInvoice ? [...state.invoices, expenseInvoice] : state.invoices,
+        journal,
+      };
+    }
+    case 'UPDATE_EXPENSE': {
+      const updatedExpense = action.payload;
+      const categories = updatedExpense?.category && !state.expenseCategories.includes(updatedExpense.category)
+        ? [...state.expenseCategories, updatedExpense.category]
+        : state.expenseCategories;
+      const expenseJournalEntry = buildExpenseJournalEntry(updatedExpense, chartOfAccounts);
+      const reference = `expense:${updatedExpense?.id}`;
+      const journal = expenseJournalEntry
+        ? replaceJournalEntries(state.journal, [expenseJournalEntry])
+        : removeJournalEntriesByReference(state.journal, [reference]);
+      return {
+        ...state,
+        expenses: state.expenses.map((expense) => (expense.id === updatedExpense.id ? updatedExpense : expense)),
+        expenseCategories: categories,
+        journal,
+      };
+    }
+    case 'DELETE_EXPENSE': {
+      const expenseId = action.payload;
+      return {
+        ...state,
+        expenses: state.expenses.filter((expense) => expense.id !== expenseId),
+        journal: removeJournalEntriesByReference(state.journal, [`expense:${expenseId}`]),
+      };
+    }
+    case 'ADD_SALE': {
+      const { sale, updatedProducts } = action.payload ?? {};
+      if (!sale) {
+        return state;
+      }
+      const saleInvoice = createInvoiceFromSale(sale, state);
+      const { tasks: nextTasks, notifications: taskNotifications } = applySaleToTasks(state, sale);
+      const journalEntries = buildSaleJournalEntries(sale, { products: state.products, customers: state.customers });
+      const journal = journalEntries.length
+        ? replaceJournalEntries(state.journal, journalEntries)
+        : state.journal;
+      const notifications = taskNotifications.length
+        ? [...state.notifications, ...taskNotifications.map(ensureNotificationId)]
+        : state.notifications;
+      return {
+        ...state,
+        sales: [...state.sales, sale],
+        products: updatedProducts ?? state.products,
+        invoices: saleInvoice ? [...state.invoices, saleInvoice] : state.invoices,
+        tasks: nextTasks,
+        notifications,
+        journal,
+      };
+    }
+    case 'UPDATE_SALE': {
+      const updatedSale = action.payload;
+      const journalEntries = buildSaleJournalEntries(updatedSale, { products: state.products, customers: state.customers });
+      const referencesToRemove = [`sale:${updatedSale?.id}:revenue`, `sale:${updatedSale?.id}:cogs`];
+      let journal = removeJournalEntriesByReference(state.journal, referencesToRemove);
+      if (journalEntries.length) {
+        journal = replaceJournalEntries(journal, journalEntries);
+      }
+      return {
+        ...state,
+        sales: state.sales.map((sale) => (sale.id === updatedSale.id ? { ...sale, ...updatedSale } : sale)),
+        journal,
+      };
+    }
+    case 'DELETE_SALE': {
+      const saleId = action.payload;
+      const references = [`sale:${saleId}:revenue`, `sale:${saleId}:cogs`];
+      return {
+        ...state,
+        sales: state.sales.filter((sale) => sale.id !== saleId),
+        journal: removeJournalEntriesByReference(state.journal, references),
+      };
+    }
+    
+    case 'CREATE_JOURNAL_ENTRY': {
+      try {
+        const entry = buildManualJournalEntry(action.payload ?? {});
+        return {
+          ...state,
+          journal: replaceJournalEntries(state.journal, [entry]),
+        };
+      } catch (error) {
+        console.error('Failed to create journal entry', error);
+        return state;
+      }
+    }
+    case 'DELETE_JOURNAL_ENTRY': {
+      const target = action.payload;
+      if (target == null) {
+        return state;
+      }
+      if (typeof target === 'string' || typeof target === 'number') {
+        return {
+          ...state,
+          journal: state.journal.filter((entry) => entry.id !== target && entry.reference !== target),
+        };
+      }
+      const { id: entryId, reference } = target;
+      return {
+        ...state,
+        journal: state.journal.filter((entry) => {
+          if (entryId != null && entry.id === entryId) {
+            return false;
+          }
+          if (reference != null && entry.reference === reference) {
+            return false;
+          }
+          return true;
+        }),
+      };
+    }
+    case 'CREATE_BRANCH': {
+      const { name, memberIds, createdBy } = action.payload ?? {};
+      const trimmedName = typeof name === 'string' ? name.trim() : '';
+      const normalizedMembers = Array.isArray(memberIds)
+        ? Array.from(new Set(memberIds.map((id) => Number(id)).filter((value) => Number.isFinite(value))))
+        : [];
+      if (!trimmedName || !normalizedMembers.length) {
+        return state;
+      }
+      const creatorId = Number.isFinite(Number(createdBy))
+        ? Number(createdBy)
+        : state.currentUser?.id ?? null;
+      if (creatorId != null && !normalizedMembers.includes(creatorId)) {
+        normalizedMembers.push(creatorId);
+      }
+      const branch = {
+        id: Date.now(),
+        name: trimmedName,
+        members: normalizedMembers,
+        createdBy: creatorId,
+      };
+      return {
+        ...state,
+        branches: [...state.branches, branch],
+        currentBranchId: branch.id,
+      };
+    }
+    case 'SET_CURRENT_BRANCH':
+      return { ...state, currentBranchId: action.payload ?? null };
+    case 'POST_BRANCH_ANNOUNCEMENT': {
+      const payload = action.payload ?? {};
+      const branchId = Number(payload.branchId);
+      const content = typeof payload.content === 'string' ? payload.content.trim() : '';
+      if (!Number.isFinite(branchId) || !content) {
+        return state;
+      }
+      const labelColor = typeof payload.labelColor === 'string' ? payload.labelColor : 'green';
+      const createdBy = Number.isFinite(Number(payload.createdBy))
+        ? Number(payload.createdBy)
+        : state.currentUser?.id ?? null;
+      const announcement = {
+        id: Date.now(),
+        branchId,
+        content,
+        labelColor,
+        createdBy,
+        timestamp: new Date().toISOString(),
+      };
+      return {
+        ...state,
+        announcements: [...state.announcements, announcement],
+      };
+    }
+    case 'ADD_BRANCH_MESSAGE': {
+      const payload = action.payload ?? {};
+      const branchId = Number(payload.branchId);
+      const content = typeof payload.content === 'string' ? payload.content.trim() : '';
+      const authorId = Number.isFinite(Number(payload.from))
+        ? Number(payload.from)
+        : state.currentUser?.id ?? null;
+      if (!Number.isFinite(branchId) || !content || authorId == null) {
+        return state;
+      }
+      const message = {
+        id: Date.now(),
+        from: authorId,
+        to: null,
+        branchId,
+        content,
+        type: 'branch',
+        timestamp: new Date().toISOString(),
+        readBy: Array.isArray(payload.readBy) ? payload.readBy : [authorId],
+      };
+      return {
+        ...state,
+        messages: [...state.messages, message],
+      };
+    }
+    case 'SET_INBOX_FILTER':
+      return { ...state, inboxFilter: action.payload ?? 'all' };
+    case 'SET_ACTIVE_CONVERSATION':
+      return { ...state, activeConversationId: action.payload ?? null };
+    case 'MARK_CONVERSATION_READ': {
+      const conversationId = action.payload ?? null;
+      if (!conversationId) {
+        return state;
+      }
+      const currentUserId = state.currentUser?.id ?? null;
+      let updated = false;
+      const messages = state.messages.map((message) => {
+        const normalized = normalizeStoredMessage(message);
+        if (normalized.conversationId !== conversationId) {
+          return message;
+        }
+        updated = true;
+        const readSet = new Set(normalized.readBy ?? []);
+        if (currentUserId != null) {
+          readSet.add(currentUserId);
+        }
+        return {
+          ...normalized,
+          read: true,
+          readBy: Array.from(readSet),
+        };
+      });
+      return updated ? { ...state, messages } : state;
+    }
+    case 'SEND_MESSAGE': {
+      const payload = action.payload ?? {};
+      const conversationId = payload.conversationId ?? null;
+      const content = typeof payload.content === 'string' ? payload.content.trim() : '';
+      if (!conversationId || !content) {
+        return state;
+      }
+      const senderId = state.currentUser?.id ?? null;
+      if (senderId == null) {
+        return state;
+      }
+      const baseMessageEntry = state.messages.find((message) => {
+        const normalized = normalizeStoredMessage(message);
+        return normalized.conversationId === conversationId;
+      });
+      const normalizedBase = baseMessageEntry ? normalizeStoredMessage(baseMessageEntry) : null;
+      const conversationType = payload.conversationType ?? normalizedBase?.conversationType ?? 'direct';
+      const branchId = normalizedBase?.branchId ?? payload.branchId ?? null;
+      const branchName = normalizedBase?.branchName ?? payload.branchName ?? null;
+      const participantIds = Array.isArray(payload.participantIds)
+        ? payload.participantIds
+        : Array.isArray(normalizedBase?.participantIds)
+          ? normalizedBase.participantIds
+          : [];
+      const derivedRecipient = participantIds.find((id) => id != null && id !== senderId) ?? normalizedBase?.to ?? null;
+      const message = normalizeStoredMessage({
+        id: Date.now(),
+        conversationId,
+        conversationType,
+        branchId,
+        branchName,
+        participantIds,
+        from: senderId,
+        to: payload.to ?? payload.recipientId ?? derivedRecipient ?? null,
+        content,
+        type: conversationType === 'branch' ? 'branch' : conversationType === 'task' ? 'task' : 'personal',
+        timestamp: new Date().toISOString(),
+        replyToId: payload.replyTo ?? payload.replyToId ?? null,
+        read: true,
+        readBy: [senderId],
+      });
+      return {
+        ...state,
+        messages: [...state.messages, message],
+      };
+    }
+    case 'ADD_REACTION': {
+      const payload = action.payload ?? {};
+      const messageId = Number(payload.messageId);
+      const emoji = payload.emoji;
+      if (!Number.isFinite(messageId) || !emoji) {
+        return state;
+      }
+      const userId = state.currentUser?.id ?? null;
+      if (userId == null) {
+        return state;
+      }
+      let updated = false;
+      const messages = state.messages.map((message) => {
+        if (message.id !== messageId) {
+          return message;
+        }
+        const normalized = normalizeStoredMessage(message);
+        const reactions = normalizeReactions(normalized.reactions);
+        const index = reactions.findIndex((reaction) => reaction.emoji === emoji);
+        if (index === -1) {
+          reactions.push({ emoji, users: [userId] });
+          updated = true;
+        } else if (!reactions[index].users.includes(userId)) {
+          reactions[index] = {
+            ...reactions[index],
+            users: [...reactions[index].users, userId],
+          };
+          updated = true;
+        } else {
+          return message;
+        }
+        return {
+          ...normalized,
+          reactions,
+        };
+      });
+      return updated ? { ...state, messages } : state;
+    }
+    case 'TOGGLE_REACTION': {
+      const payload = action.payload ?? {};
+      const messageId = Number(payload.messageId);
+      const emoji = payload.emoji;
+      if (!Number.isFinite(messageId) || !emoji) {
+        return state;
+      }
+      const userId = state.currentUser?.id ?? null;
+      if (userId == null) {
+        return state;
+      }
+      let updated = false;
+      const messages = state.messages.map((message) => {
+        if (message.id !== messageId) {
+          return message;
+        }
+        const normalized = normalizeStoredMessage(message);
+        const reactions = normalizeReactions(normalized.reactions);
+        const index = reactions.findIndex((reaction) => reaction.emoji === emoji);
+        if (index === -1) {
+          reactions.push({ emoji, users: [userId] });
+          updated = true;
+        } else if (reactions[index].users.includes(userId)) {
+          const filteredUsers = reactions[index].users.filter((id) => id !== userId);
+          if (filteredUsers.length === 0) {
+            reactions.splice(index, 1);
+          } else {
+            reactions[index] = { ...reactions[index], users: filteredUsers };
+          }
+          updated = true;
+        } else {
+          reactions[index] = {
+            ...reactions[index],
+            users: [...reactions[index].users, userId],
+          };
+          updated = true;
+        }
+        return {
+          ...normalized,
+          reactions,
+        };
+      });
+      return updated ? { ...state, messages } : state;
+    }    case 'MARK_MESSAGE_READ': {
+      const messageId = Number(action.payload);
+      if (!Number.isFinite(messageId)) {
+        return state;
+      }
+      const currentUserId = state.currentUser?.id ?? null;
+      let updated = false;
+      const messages = state.messages.map((message) => {
+        if (message.id !== messageId) {
+          return message;
+        }
+        const normalized = normalizeStoredMessage(message);
+        const readBy = new Set(normalized.readBy ?? []);
+        if (currentUserId != null) {
+          readBy.add(currentUserId);
+        }
+        updated = true;
+        return {
+          ...normalized,
+          read: true,
+          readBy: Array.from(readBy),
+        };
+      });
+      return updated ? { ...state, messages } : state;
+    }
+        case 'ADD_MESSAGE': {
+      const message = normalizeStoredMessage(action.payload);
+      if (!message) {
+        return state;
+      }
+      return {
+        ...state,
+        messages: [...state.messages, message],
+      };
+    }
+    case 'DELETE_MESSAGE': {
+      const messageId = Number(action.payload);
+      if (!Number.isFinite(messageId)) {
+        return state;
+      }
+      const messages = state.messages.filter((message) => message.id !== messageId);
+      return messages.length === state.messages.length ? state : { ...state, messages };
+    }
+    case 'HANDLE_MESSAGE_TASK_ACTION': {
+      const payload = action.payload ?? {};
+      const messageId = Number(payload.messageId);
+      if (!Number.isFinite(messageId)) {
+        return state;
+      }
+      const index = state.messages.findIndex((message) => message.id === messageId);
+      if (index === -1) {
+        return state;
+      }
+      const message = state.messages[index];
+      const actorId = Number.isFinite(Number(payload.actorId)) ? Number(payload.actorId) : state.currentUser?.id ?? null;
+      const actor = actorId != null ? state.users.find((user) => user.id === actorId) ?? null : null;
+      const historyEntry = {
+        userId: actor?.id ?? null,
+        userName: actor?.name ?? actor?.username ?? 'User',
+        action: '',
+        timestamp: new Date().toISOString(),
+      };
+      if (payload.reason) {
+        historyEntry.reason = payload.reason;
+      }
+      const updatedMessage = { ...message, history: Array.isArray(message.history) ? [...message.history] : [] };
+      const manager = state.users.find((user) => user.role === 'manager') ?? null;
+      let updatedProducts = state.products;
+      switch (payload.actionType) {
+        case 'send-stock-request':
+          updatedMessage.status = 'pending_manager_approval';
+          updatedMessage.to = manager?.id ?? updatedMessage.to ?? null;
+          updatedMessage.read = false;
+          historyEntry.action = 'Request sent for manager approval';
+          break;
+        case 'approve-stock-request':
+          updatedMessage.status = 'approved_pending_acceptance';
+          updatedMessage.to = updatedMessage.from;
+          updatedMessage.read = false;
+          historyEntry.action = 'Request approved';
+          break;
+        case 'accept-stock': {
+          updatedMessage.status = 'completed';
+          updatedMessage.read = true;
+          historyEntry.action = 'Stock accepted and inventory updated';
+          const productId = updatedMessage.taskDetails?.productId;
+          const quantity = Number(updatedMessage.taskDetails?.requestedStock) || 0;
+          if (Number.isFinite(productId) && quantity > 0) {
+            updatedProducts = state.products.map((product) => (product.id === productId ? { ...product, stock: (product.stock || 0) + quantity } : product));
+          }
+          break;
+        }
+        case 'decline-request':
+          updatedMessage.status = 'declined';
+          updatedMessage.read = true;
+          historyEntry.action = 'Request declined';
+          break;
+        default:
+          return state;
+      }
+      updatedMessage.history = [...updatedMessage.history, historyEntry];
+      const updatedMessages = state.messages.slice();
+      updatedMessages[index] = updatedMessage;
+      return {
+        ...state,
+        messages: updatedMessages,
+        products: updatedProducts,
+      };
+    }
+    case 'START_AI_SESSION':
+      return {
+        ...state,
+        aiViewPhase: 'chat',
+        currentAICategory: action.payload.categoryKey,
+        currentAICategoryText: action.payload.categoryText,
+        aiChatHistory: action.payload.history ?? [],
+        aiAudioPlayers: {},
+      };
+    case 'SHOW_AI_CATEGORIES':
+      return {
+        ...state,
+        aiViewPhase: 'selection',
+        currentAICategory: null,
+        currentAICategoryText: null,
+        aiChatHistory: [],
+        aiAudioPlayers: {},
+      };
+    case 'APPEND_AI_MESSAGE':
+      return {
+        ...state,
+        aiChatHistory: [...state.aiChatHistory, action.payload],
+      };
+    case 'SET_AI_CHAT_HISTORY':
+      return {
+        ...state,
+        aiChatHistory: Array.isArray(action.payload) ? action.payload : [],
+      };
+    case 'SET_AI_SETTINGS':
+      return {
+        ...state,
+        aiSettings: { ...state.aiSettings, ...(action.payload ?? {}) },
+      };
+    case 'OPEN_MODAL':
+      return {
+        ...state,
+        modal: {
+          open: true,
+          content: action.payload.content,
+          props: action.payload.props ?? null,
+        },
+      };
+    case 'CLOSE_MODAL':
+      return { ...state, modal: { open: false, content: null, props: null } };
+    case 'PUSH_NOTIFICATION':
+      return { ...state, notifications: [...state.notifications, action.payload] };
+    case 'DISMISS_NOTIFICATION':
+      return {
+        ...state,
+        notifications: state.notifications.filter((note) => note.id !== action.payload),
+      };
+    default:
+      return state;
+  }
+}
+
+export function AppStateProvider({ children }) {
+  const [state, dispatch] = useReducer(appReducer, initialAppState);
+  const hasHydratedFromStorage = useRef(false);
+  const skipFirstPersist = useRef(true);
+
+  useEffect(() => {
+    if (hasHydratedFromStorage.current) return;
+    hasHydratedFromStorage.current = true;
+
+    try {
+      const stored = localStorage.getItem(LOCAL_STORAGE_KEY);
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed && typeof parsed === 'object') {
+          dispatch({ type: 'HYDRATE_STATE', payload: parsed });
+        }
+      }
+    } catch (error) {
+      console.error('Failed to load stored Owlio data', error);
+    }
+
+    try {
+      const storedTheme = localStorage.getItem(THEME_STORAGE_KEY);
+      if (storedTheme) {
+        dispatch({ type: 'SET_THEME', payload: storedTheme });
+      }
+    } catch (error) {
+      console.error('Failed to load stored theme', error);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (skipFirstPersist.current) {
+      skipFirstPersist.current = false;
+      return;
+    }
+
+    try {
+      const persistable = {
+        ...state,
+        notifications: [],
+        modal: { open: false, content: null, props: null },
+        mobileMenuOpen: false,
+        aiLoading: false,
+        aiAnswer: null,
+        pixelAnimation: null,
+        quickSale: { ...quickSaleInitialState },
+      };
+      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(persistable));
+      localStorage.setItem(THEME_STORAGE_KEY, state.theme ?? 'dark-theme');
+    } catch (error) {
+      console.error('Failed to persist Owlio data', error);
+    }
+  }, [state]);
+
+  const actions = useMemo(
+    () => ({
+      setView(view) {
+        dispatch({ type: 'SET_VIEW', payload: view });
+      },
+      setPendingRole(role) {
+        dispatch({ type: 'SET_PENDING_ROLE', payload: role });
+      },
+      login(user, nextView) {
+        dispatch({ type: 'LOGIN', payload: { user, nextView } });
+      },
+      logout() {
+        dispatch({ type: 'LOGOUT' });
+      },
+      setUsers(users) {
+        dispatch({ type: 'SET_USERS', payload: users });
+      },
+      addEmployee(employee) {
+        dispatch({ type: 'ADD_EMPLOYEE', payload: employee });
+      },
+      updateEmployee(employee) {
+        dispatch({ type: 'UPDATE_EMPLOYEE', payload: employee });
+      },
+      deleteEmployee(employeeId) {
+        dispatch({ type: 'DELETE_EMPLOYEE', payload: employeeId });
+      },
+      toggleMobileMenu() {
+        dispatch({ type: 'TOGGLE_MOBILE_MENU' });
+      },
+      setMobileMenu(open) {
+        dispatch({ type: 'SET_MOBILE_MENU', payload: open });
+      },
+      setTheme(theme) {
+        dispatch({ type: 'SET_THEME', payload: theme });
+        try {
+          localStorage.setItem(THEME_STORAGE_KEY, theme);
+        } catch (error) {
+          console.error('Failed to persist theme', error);
+        }
+      },
+      setAiMode(mode) {
+        dispatch({ type: 'SET_AI_MODE', payload: mode });
+      },
+      setBotAnalysis(analysis) {
+        dispatch({ type: 'SET_BOT_ANALYSIS', payload: analysis });
+      },
+      setSelectedCountry(code) {
+        dispatch({ type: 'SET_SELECTED_COUNTRY', payload: code });
+      },
+      setCompanyName(name) {
+        dispatch({ type: 'SET_COMPANY_NAME', payload: name });
+      },
+      setLowStockThreshold(value) {
+        const parsed = Number.parseInt(value, 10);
+        const normalized = Number.isNaN(parsed) || parsed < 0 ? 0 : parsed;
+        dispatch({ type: 'SET_LOW_STOCK_THRESHOLD', payload: normalized });
+      },
+      setTaskFilter(filter) {
+        dispatch({ type: 'SET_TASK_FILTER', payload: filter });
+      },
+      createTask(payload) {
+        dispatch({ type: 'CREATE_TASK', payload });
+      },
+      updateTask(task) {
+        dispatch({ type: 'UPDATE_TASK', payload: task });
+      },
+      deleteTask(taskId) {
+        dispatch({ type: 'DELETE_TASK', payload: taskId });
+      },
+      joinTask(payload) {
+        dispatch({ type: 'JOIN_TASK', payload });
+      },
+      assignTaskToBranch(payload) {
+        dispatch({ type: 'ASSIGN_TASK_TO_BRANCH', payload });
+      },
+      createBranch(data) {
+        dispatch({ type: 'CREATE_BRANCH', payload: data });
+      },
+      setCurrentBranch(branchId) {
+        dispatch({ type: 'SET_CURRENT_BRANCH', payload: branchId });
+      },
+      postBranchAnnouncement(payload) {
+        dispatch({ type: 'POST_BRANCH_ANNOUNCEMENT', payload });
+      },
+      addBranchMessage(payload) {
+        dispatch({ type: 'ADD_BRANCH_MESSAGE', payload });
+      },
+      setInboxFilter(filter) {
+        dispatch({ type: 'SET_INBOX_FILTER', payload: filter });
+      },
+      setInboxSearchTerm(term) {
+        dispatch({ type: 'SET_INBOX_SEARCH_TERM', payload: term });
+      },
+      setActiveConversation(conversationId) {
+        dispatch({ type: 'SET_ACTIVE_CONVERSATION', payload: conversationId });
+      },
+      markConversationRead(conversationId) {
+        dispatch({ type: 'MARK_CONVERSATION_READ', payload: conversationId });
+      },
+      sendMessage(payload) {
+        dispatch({ type: 'SEND_MESSAGE', payload });
+      },
+      addReaction(payload) {
+        dispatch({ type: 'ADD_REACTION', payload });
+      },
+      toggleReaction(payload) {
+        dispatch({ type: 'TOGGLE_REACTION', payload });
+      },
+      markMessageRead(messageId) {
+        dispatch({ type: 'MARK_MESSAGE_READ', payload: messageId });
+      },
+      handleMessageTaskAction(payload) {
+        dispatch({ type: 'HANDLE_MESSAGE_TASK_ACTION', payload });
+      },
+      createMessage(message) {
+        dispatch({ type: 'ADD_MESSAGE', payload: message });
+      },
+      deleteMessage(messageId) {
+        dispatch({ type: 'DELETE_MESSAGE', payload: messageId });
+      },
+      startAiChatSession(categoryKey, categoryText) {
+        dispatch({
+          type: 'START_AI_SESSION',
+          payload: {
+            categoryKey,
+            categoryText,
+            history: [
+              {
+                sender: 'welcome',
+                content: `<p>Great, how can I help you with <strong>${categoryText}</strong>?</p>`,
+                timestamp: Date.now(),
+              },
+            ],
+          },
+        });
+      },
+      showAiCategories() {
+        dispatch({ type: 'SHOW_AI_CATEGORIES' });
+      },
+      appendAiMessage(message) {
+        dispatch({ type: 'APPEND_AI_MESSAGE', payload: message });
+      },
+      setAiChatHistory(history) {
+        dispatch({ type: 'SET_AI_CHAT_HISTORY', payload: history });
+      },
+      setAiSettings(settings) {
+        dispatch({ type: 'SET_AI_SETTINGS', payload: settings });
+      },
+      setQuickSaleActive(active) {
+        dispatch({ type: 'SET_QUICK_SALE_ACTIVE', payload: active });
+      },
+      updateQuickSaleState(partial) {
+        dispatch({ type: 'UPDATE_QUICK_SALE', payload: partial });
+      },
+      finalizeQuickSale(payload) {
+        dispatch({ type: 'FINALIZE_QUICK_SALE', payload });
+      },
+      addProduct(product) {
+        dispatch({ type: 'ADD_PRODUCT', payload: product });
+      },
+      updateProduct(product) {
+        dispatch({ type: 'UPDATE_PRODUCT', payload: product });
+      },
+      deleteProduct(productId) {
+        dispatch({ type: 'DELETE_PRODUCT', payload: productId });
+      },
+      addInvoice(invoice) {
+        dispatch({ type: 'ADD_INVOICE', payload: invoice });
+      },
+      updateInvoice(invoice) {
+        dispatch({ type: 'UPDATE_INVOICE', payload: invoice });
+      },
+      deleteInvoice(invoiceId) {
+        dispatch({ type: 'DELETE_INVOICE', payload: invoiceId });
+      },
+      addCustomer(customer) {
+        dispatch({ type: 'ADD_CUSTOMER', payload: customer });
+      },
+      updateCustomer(customer) {
+        dispatch({ type: 'UPDATE_CUSTOMER', payload: customer });
+      },
+      deleteCustomer(customerId) {
+        dispatch({ type: 'DELETE_CUSTOMER', payload: customerId });
+      },
+      addExpense(expense) {
+        dispatch({ type: 'ADD_EXPENSE', payload: expense });
+      },
+      updateExpense(expense) {
+        dispatch({ type: 'UPDATE_EXPENSE', payload: expense });
+      },
+      deleteExpense(expenseId) {
+        dispatch({ type: 'DELETE_EXPENSE', payload: expenseId });
+      },
+      addSale(payload) {
+        dispatch({ type: 'ADD_SALE', payload });
+      },
+      updateSale(sale) {
+        dispatch({ type: 'UPDATE_SALE', payload: sale });
+      },
+      deleteSale(saleId) {
+        dispatch({ type: 'DELETE_SALE', payload: saleId });
+      },
+      createJournalEntry(entry) {
+        dispatch({ type: 'CREATE_JOURNAL_ENTRY', payload: entry });
+      },
+      deleteJournalEntry(target) {
+        dispatch({ type: 'DELETE_JOURNAL_ENTRY', payload: target });
+      },
+      openModal(content, props) {
+        dispatch({ type: 'OPEN_MODAL', payload: { content, props } });
+      },
+      closeModal() {
+        dispatch({ type: 'CLOSE_MODAL' });
+      },
+      pushNotification(notification) {
+        const normalized = createNotification(notification);
+        const withId = normalized.id != null
+          ? normalized
+          : { ...normalized, id: `note-${Date.now()}-${Math.random().toString(36).slice(2)}` };
+        dispatch({ type: 'PUSH_NOTIFICATION', payload: withId });
+      },
+      dismissNotification(id) {
+        dispatch({ type: 'DISMISS_NOTIFICATION', payload: id });
+      },
+    }), [],
+  );
+
+  const conversations = useMemo(
+    () => selectConversations(state),
+    [state.messages, state.users, state.currentUser],
+  );
+
+  const stateValue = useMemo(
+    () => ({ ...state, conversations }),
+    [state, conversations],
+  );
+
+  return (
+    <AppStateContext.Provider value={stateValue}>
+      <AppActionsContext.Provider value={actions}>
+        {children}
+      </AppActionsContext.Provider>
+    </AppStateContext.Provider>
+  );
+}
+
+export function useAppState() {
+  const context = useContext(AppStateContext);
+  if (context === null) {
+    throw new Error('useAppState must be used within an AppStateProvider');
+  }
+  return context;
+}
+
+export function useAppActions() {
+  const context = useContext(AppActionsContext);
+  if (context === null) {
+    throw new Error('useAppActions must be used within an AppStateProvider');
+  }
+  return context;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

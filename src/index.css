@@ -1,0 +1,124 @@
+@import "./styles/app.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+/* === React Scaffold Helpers (to be replaced as legacy markup is ported) === */
+.view-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 4rem 2rem;
+  gap: 1.25rem;
+  color: var(--text-secondary, #9ca3af);
+  min-height: 60vh;
+}
+
+.view-placeholder__title {
+  font-size: clamp(1.5rem, 2.4vw, 2.5rem);
+  font-weight: 700;
+  margin: 0;
+  color: var(--text-primary, #e5e7eb);
+}
+
+.view-placeholder__description {
+  font-size: clamp(0.95rem, 1.2vw, 1.1rem);
+  max-width: 540px;
+  margin: 0;
+}
+
+.quick-sale-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2500;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
+  background: rgba(4, 7, 13, 0.85);
+  backdrop-filter: blur(12px);
+}
+
+.ai-mode-button,
+.theme-toggle,
+.icon-button,
+.logout-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.6rem 0.9rem;
+  border-radius: 0.75rem;
+  border: 1px solid color-mix(in srgb, var(--accent-secondary, #0ea5e9) 15%, transparent);
+  background: color-mix(in srgb, var(--bg-tertiary, #1f2937) 75%, transparent);
+  color: var(--text-secondary, #9ca3af);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.ai-mode-button:hover,
+.theme-toggle:hover,
+.icon-button:hover,
+.logout-button:hover {
+  color: var(--accent-primary, #00d4aa);
+  border-color: color-mix(in srgb, var(--accent-primary, #00d4aa) 40%, transparent);
+}
+
+.logout-button {
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.2), rgba(190, 18, 60, 0.25));
+  color: #fca5a5;
+}
+
+.avatar {
+  width: 2.5rem;
+  height: 2.5rem;
+  border-radius: 9999px;
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.6), rgba(236, 72, 153, 0.6));
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.avatar__initial {
+  color: white;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+.notification__icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.notification__content {
+  flex: 1;
+}
+
+.notification__message {
+  margin: 0;
+  font-weight: 600;
+  color: var(--text-primary, #e5e7eb);
+}
+
+.notification__description {
+  margin: 0.25rem 0 0;
+  color: var(--text-secondary, #9ca3af);
+  font-size: 0.85rem;
+}
+
+.notification__dismiss {
+  background: none;
+  border: none;
+  color: var(--text-muted, #6b7280);
+  cursor: pointer;
+  padding: 0.25rem;
+  border-radius: 0.5rem;
+  transition: color 0.2s ease, background 0.2s ease;
+}
+
+.notification__dismiss:hover {
+  color: var(--text-primary, #e5e7eb);
+  background: rgba(255, 255, 255, 0.08);
+}
+
