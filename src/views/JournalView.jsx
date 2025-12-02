@@ -188,8 +188,12 @@ export default function JournalView() {
                           </td>
                         ) : null}
                         <td className="px-6 py-4 text-sm text-gray-200">{accountLabel}</td>
-                        <td className="px-6 py-4 text-right font-mono text-blue-400">
-                          {line.debit > 0 ? formatAmount(line.debit, selectedCountry) : ''}
+                        <td className="px-6 py-4 text-right">
+                          {line.debit > 0 ? (
+                            <span className="inline-block px-3 py-1 rounded-lg bg-blue-500/10 border border-blue-500/20 font-mono text-blue-400">
+                              {formatAmount(line.debit, selectedCountry)}
+                            </span>
+                          ) : ''}
                         </td>
                         <td className="px-6 py-4 text-right font-mono text-teal-400">
                           {line.credit > 0 ? formatAmount(line.credit, selectedCountry) : ''}
@@ -213,7 +217,11 @@ export default function JournalView() {
               <tfoot className="bg-gray-900/40">
                 <tr>
                   <td className="px-6 py-4 text-sm font-semibold text-white" colSpan={3}>Totals</td>
-                  <td className="px-6 py-4 text-right font-mono text-blue-400 font-semibold">{formatAmount(totals.debit, selectedCountry)}</td>
+                  <td className="px-6 py-4 text-right">
+                    <span className="inline-block px-3 py-1 rounded-lg bg-blue-500/10 border border-blue-500/20 font-mono text-blue-400 font-semibold">
+                      {formatAmount(totals.debit, selectedCountry)}
+                    </span>
+                  </td>
                   <td className="px-6 py-4 text-right font-mono text-teal-400 font-semibold">{formatAmount(totals.credit, selectedCountry)}</td>
                   <td className="px-6 py-4" />
                 </tr>

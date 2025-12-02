@@ -190,7 +190,13 @@ export default function LedgerView() {
                   <tr key={`${account.code}-${index}`} className="bg-gray-950/40 hover:bg-gray-900/40 transition-colors">
                     <td className="px-6 py-4 text-sm text-white">{transaction.date}</td>
                     <td className="px-6 py-4 text-sm text-gray-300">{transaction.description}</td>
-                    <td className="px-6 py-4 text-right font-mono text-blue-400">{formatAmount(transaction.debit, selectedCountry)}</td>
+                    <td className="px-6 py-4 text-right">
+                      {formatAmount(transaction.debit, selectedCountry) ? (
+                        <span className="inline-block px-3 py-1 rounded-lg bg-blue-500/10 border border-blue-500/20 font-mono text-blue-400">
+                          {formatAmount(transaction.debit, selectedCountry)}
+                        </span>
+                      ) : ''}
+                    </td>
                     <td className="px-6 py-4 text-right font-mono text-teal-400">{formatAmount(transaction.credit, selectedCountry)}</td>
                     <td className="px-6 py-4 text-right font-mono text-white">
                       {formatCurrency(Math.abs(transaction.balance), { countryCode: selectedCountry, showSymbol: true })}
@@ -205,7 +211,11 @@ export default function LedgerView() {
             <tfoot className="bg-gray-900/40 text-gray-200">
               <tr>
                 <td className="px-6 py-4 text-sm font-semibold" colSpan={2}>Totals</td>
-                <td className="px-6 py-4 text-right font-mono text-blue-400 font-semibold">{formatCurrency(totalDebit, { countryCode: selectedCountry, showSymbol: true })}</td>
+                <td className="px-6 py-4 text-right">
+                  <span className="inline-block px-3 py-1 rounded-lg bg-blue-500/10 border border-blue-500/20 font-mono text-blue-400 font-semibold">
+                    {formatCurrency(totalDebit, { countryCode: selectedCountry, showSymbol: true })}
+                  </span>
+                </td>
                 <td className="px-6 py-4 text-right font-mono text-teal-400 font-semibold">{formatCurrency(totalCredit, { countryCode: selectedCountry, showSymbol: true })}</td>
                 <td className="px-6 py-4" />
               </tr>

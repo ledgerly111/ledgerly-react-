@@ -1,8 +1,10 @@
 @import "./styles/app.css";
+@import "./styles/stat-card-fix.css";
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
 /* === React Scaffold Helpers (to be replaced as legacy markup is ported) === */
 .view-placeholder {
   display: flex;
@@ -85,6 +87,7 @@
   font-weight: 700;
   letter-spacing: 0.05em;
 }
+
 .notification__icon {
   display: flex;
   align-items: center;
@@ -121,4 +124,3 @@
   color: var(--text-primary, #e5e7eb);
   background: rgba(255, 255, 255, 0.08);
 }
-

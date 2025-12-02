@@ -1,0 +1,22 @@
+/* === FIX: Stat Card Icon Alignment === */
+/* Ensures all icons in stat cards are perfectly centered vertically and horizontally */
+[class*="bg-"][class*="/20"].rounded-xl,
+[class*="bg-"][class*="/10"].rounded-xl,
+[class*="bg-"][class*="500/20"],
+[class*="bg-"][class*="500/10"] {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+}
+
+/* Icon-specific centering for stat cards */
+[class*="bg-"][class*="/20"].rounded-xl>i,
+[class*="bg-"][class*="/10"].rounded-xl>i,
+[class*="bg-"][class*="500/20"]>i,
+[class*="bg-"][class*="500/10"]>i {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    line-height: 1 !important;
+    vertical-align: middle !important;
+}
