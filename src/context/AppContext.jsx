@@ -4129,25 +4129,189 @@ function appReducer(state, action) {
       if (target == null) {
         return state;
       }
+
+      // Simple deletion for string/number ID (backwards compatibility)
       if (typeof target === 'string' || typeof target === 'number') {
         return {
           ...state,
           journal: state.journal.filter((entry) => entry.id !== target && entry.reference !== target),
         };
       }
-      const { id: entryId, reference } = target;
-      return {
-        ...state,
-        journal: state.journal.filter((entry) => {
-          if (entryId != null && entry.id === entryId) {
-            return false;
+
+      // Get the entry to delete
+      const { id: entryId, reference, metadata } = target;
+      const entryToDelete = state.journal.find((entry) =>
+        (entryId != null && entry.id === entryId) ||
+        (reference != null && entry.reference === reference)
+      );
+
+      if (!entryToDelete) {
+        return state;
+      }
+
+      let nextState = { ...state };
+      const logs = [];
+      const timestamp = new Date().toISOString();
+      const userName = state.currentUser?.name || 'User';
+
+      // Create base log for journal entry deletion
+      logs.push(createLogEntry({
+        actor: { id: state.currentUser?.id || null, name: userName },
+        actionType: 'DELETE_JOURNAL',
+        entity: {
+          id: entryToDelete.id,
+          date: entryToDelete.date,
+          reference: entryToDelete.reference,
+          description: entryToDelete.description,
+        },
+        message: `Journal entry deleted: ${entryToDelete.description || 'Untitled'}`,
+      }));
+
+      // Handle reversal based on entry source
+      const source = metadata?.source || entryToDelete?.metadata?.source;
+      const saleId = metadata?.saleId || entryToDelete?.metadata?.saleId;
+      const expenseId = metadata?.expenseId || entryToDelete?.metadata?.expenseId;
+      const purchaseOrderId = metadata?.purchaseOrderId || entryToDelete?.metadata?.purchaseOrderId;
+
+      // Reverse SALE entry
+      if (source === 'sale' && saleId) {
+        const sale = state.sales.find((s) => s.id === saleId);
+        if (sale) {
+          // Restore product inventory
+          const updatedProducts = state.products.map((product) => {
+            const saleItem = (sale.items || []).find((item) => item.productId === product.id);
+            if (!saleItem) {
+              return product;
+            }
+
+            const baseQuantity = getSaleItemBaseQuantity(saleItem);
+            if (baseQuantity <= 0) {
+              return product;
+            }
+
+            const currentStock = Number(product.stock) || 0;
+            const restoredStock = currentStock + baseQuantity;
+
+            // Log inventory restoration
+            logs.push(createLogEntry({
+              actor: { id: state.currentUser?.id || null, name: userName },
+              actionType: 'UPDATE_PRODUCT',
+              entity: {
+                name: product.name,
+                id: product.id,
+              },
+              changes: {
+                stock: { from: currentStock, to: restoredStock },
+              },
+              message: `Inventory restored for "${product.name}": +${baseQuantity} units (Sale #${saleId} reversed)`,
+            }));
+
+            return {
+              ...product,
+              stock: restoredStock,
+            };
+          });
+
+          nextState.products = updatedProducts;
+
+          // Delete the sale
+          nextState.sales = state.sales.filter((s) => s.id !== saleId);
+
+          // Log sale reversal
+          logs.push(createLogEntry({
+            actor: { id: state.currentUser?.id || null, name: userName },
+            actionType: 'DELETE_SALE',
+            entity: {
+              id: saleId,
+              customerName: sale.customer?.name || 'Customer',
+            },
+            message: `Sale #${saleId} reversed due to journal entry deletion`,
+          }));
+        } else {
+          logs.push(createLogEntry({
+            actor: { id: state.currentUser?.id || null, name: userName },
+            actionType: 'DELETE_JOURNAL',
+            entity: { id: saleId },
+            message: `Warning: Sale #${saleId} not found for reversal (already deleted or missing)`,
+          }));
+        }
+      }
+
+      // Reverse EXPENSE entry
+      if (source === 'expense' && expenseId) {
+        const expense = state.expenses.find((e) => e.id === expenseId);
+        if (expense) {
+          // Delete the expense
+          nextState.expenses = state.expenses.filter((e) => e.id !== expenseId);
+
+          // Log expense reversal
+          logs.push(createLogEntry({
+            actor: { id: state.currentUser?.id || null, name: userName },
+            actionType: 'DELETE_EXPENSE',
+            entity: {
+              id: expenseId,
+              description: expense.description || 'Untitled',
+            },
+            message: `Expense #${expenseId} reversed due to journal entry deletion`,
+          }));
+        } else {
+          logs.push(createLogEntry({
+            actor: { id: state.currentUser?.id || null, name: userName },
+            actionType: 'DELETE_JOURNAL',
+            entity: { id: expenseId },
+            message: `Warning: Expense #${expenseId} not found for reversal (already deleted or missing)`,
+          }));
+        }
+      }
+
+      // Reverse PURCHASE ORDER entry
+      if ((source === 'purchase-order' || source === 'purchase-order-payment') && purchaseOrderId) {
+        logs.push(createLogEntry({
+          actor: { id: state.currentUser?.id || null, name: userName },
+          actionType: 'DELETE_JOURNAL',
+          entity: { id: purchaseOrderId },
+          message: `Purchase order #${purchaseOrderId} journal entry reversed${source === 'purchase-order-payment' ? ' (payment)' : ''}`,
+        }));
+
+        // Note: We don't automatically delete PO or reduce inventory since
+        // the user might want to keep the PO record. They can manually adjust if needed.
+      }
+
+      // LOG MANUAL ENTRY (no reversal needed)
+      if (!source || source === 'manual') {
+        logs.push(createLogEntry({
+          actor: { id: state.currentUser?.id || null, name: userName },
+          actionType: 'DELETE_JOURNAL',
+          entity: { id: entryToDelete.id, description: entryToDelete.description },
+          message: 'Manual journal entry deleted (no reversals needed)',
+        }));
+      }
+
+      // Delete the journal entry (and related entries like COGS for sales)
+      nextState.journal = state.journal.filter((entry) => {
+        // Delete by ID or reference
+        if (entryId != null && entry.id === entryId) {
+          return false;
+        }
+        if (reference != null && entry.reference === reference) {
+          return false;
+        }
+
+        // For sales, also delete related  COGS entry
+        if (source === 'sale' && saleId) {
+          const entryMetadata = entry.metadata || {};
+          if (entryMetadata.source === 'sale' && entryMetadata.saleId === saleId) {
+            return false; // Delete both revenue and COGS entries
           }
-          if (reference != null && entry.reference === reference) {
-            return false;
-          }
-          return true;
-        }),
-      };
+        }
+
+        return true;
+      });
+
+      // Add all logs to state
+      nextState.logs = [...(state.logs || []), ...logs];
+
+      return nextState;
     }
     case 'CREATE_BRANCH': {
       const { name, memberIds, createdBy } = action.payload ?? {};

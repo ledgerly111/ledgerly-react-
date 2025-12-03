@@ -168,17 +168,17 @@ export default function LedgerView() {
 
       <div className="perplexity-card overflow-hidden">
         <div className="responsive-table">
-          <table className="w-full text-sm">
-            <thead className="border-b border-gray-700 bg-gray-900/40 text-gray-300">
+          <table className="w-full">
+            <thead className="border-b-2 border-gray-700 bg-gray-900/60">
               <tr>
-                <th className="px-6 py-3 text-left font-medium uppercase tracking-wide">Date</th>
-                <th className="px-6 py-3 text-left font-medium uppercase tracking-wide">Description</th>
-                <th className="px-6 py-3 text-right font-medium uppercase tracking-wide">Debit</th>
-                <th className="px-6 py-3 text-right font-medium uppercase tracking-wide">Credit</th>
-                <th className="px-6 py-3 text-right font-medium uppercase tracking-wide">Balance</th>
+                <th className="px-4 py-4 text-left text-xs font-bold uppercase tracking-wider text-gray-300">Date</th>
+                <th className="px-4 py-4 text-left text-xs font-bold uppercase tracking-wider text-gray-300">Description</th>
+                <th className="px-4 py-4 text-right text-xs font-bold uppercase tracking-wider text-blue-300">Debit</th>
+                <th className="px-4 py-4 text-right text-xs font-bold uppercase tracking-wider text-teal-300">Credit</th>
+                <th className="px-4 py-4 text-right text-xs font-bold uppercase tracking-wider text-gray-300">Balance</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-800">
+            <tbody className="divide-y divide-gray-800/50">
               {transactions.length === 0 ? (
                 <tr>
                   <td className="px-6 py-6 text-center text-sm text-gray-400" colSpan={5}>
@@ -187,20 +187,24 @@ export default function LedgerView() {
                 </tr>
               ) : (
                 transactions.map((transaction, index) => (
-                  <tr key={`${account.code}-${index}`} className="bg-gray-950/40 hover:bg-gray-900/40 transition-colors">
-                    <td className="px-6 py-4 text-sm text-white">{transaction.date}</td>
-                    <td className="px-6 py-4 text-sm text-gray-300">{transaction.description}</td>
-                    <td className="px-6 py-4 text-right">
-                      {formatAmount(transaction.debit, selectedCountry) ? (
-                        <span className="inline-block px-3 py-1 rounded-lg bg-blue-500/10 border border-blue-500/20 font-mono text-blue-400">
-                          {formatAmount(transaction.debit, selectedCountry)}
-                        </span>
-                      ) : ''}
+                  <tr key={`${account.code}-${index}`} className="hover:bg-gray-800/30 transition-colors">
+                    <td className="px-4 py-4 border-r border-gray-800/30">
+                      <span className="font-semibold text-white text-sm">{transaction.date}</span>
                     </td>
-                    <td className="px-6 py-4 text-right font-mono text-teal-400">{formatAmount(transaction.credit, selectedCountry)}</td>
-                    <td className="px-6 py-4 text-right font-mono text-white">
-                      {formatCurrency(Math.abs(transaction.balance), { countryCode: selectedCountry, showSymbol: true })}
-                      <span className="ml-2 text-xs uppercase tracking-wide text-gray-400">
+                    <td className="px-4 py-4 border-r border-gray-800/30">
+                      <span className="text-sm text-gray-300">{transaction.description}</span>
+                    </td>
+                    <td className="px-4 py-4 text-right font-mono text-sm font-semibold text-blue-400 border-r border-gray-800/30">
+                      {formatAmount(transaction.debit, selectedCountry) ? formatAmount(transaction.debit, selectedCountry) : '—'}
+                    </td>
+                    <td className="px-4 py-4 text-right font-mono text-sm font-semibold text-teal-400 border-r border-gray-800/30">
+                      {formatAmount(transaction.credit, selectedCountry) ? formatAmount(transaction.credit, selectedCountry) : '—'}
+                    </td>
+                    <td className="px-4 py-4 text-right">
+                      <span className="font-mono text-sm font-semibold text-white">
+                        {formatCurrency(Math.abs(transaction.balance), { countryCode: selectedCountry, showSymbol: true })}
+                      </span>
+                      <span className="ml-2 text-xs uppercase tracking-wide text-gray-500">
                         {transaction.balance >= 0 ? account.normalBalance : account.normalBalance === 'Debit' ? 'Credit' : 'Debit'}
                       </span>
                     </td>
@@ -208,16 +212,14 @@ export default function LedgerView() {
                 ))
               )}
             </tbody>
-            <tfoot className="bg-gray-900/40 text-gray-200">
+            <tfoot className="border-t-2 border-gray-700 bg-gray-900/60">
               <tr>
-                <td className="px-6 py-4 text-sm font-semibold" colSpan={2}>Totals</td>
-                <td className="px-6 py-4 text-right">
-                  <span className="inline-block px-3 py-1 rounded-lg bg-blue-500/10 border border-blue-500/20 font-mono text-blue-400 font-semibold">
-                    {formatCurrency(totalDebit, { countryCode: selectedCountry, showSymbol: true })}
-                  </span>
+                <td className="px-4 py-4 text-sm font-bold text-white" colSpan={2}>TOTALS</td>
+                <td className="px-4 py-4 text-right font-mono text-base font-bold text-blue-400 border-l border-gray-700">
+                  {formatCurrency(totalDebit, { countryCode: selectedCountry, showSymbol: true })}
                 </td>
-                <td className="px-6 py-4 text-right font-mono text-teal-400 font-semibold">{formatCurrency(totalCredit, { countryCode: selectedCountry, showSymbol: true })}</td>
-                <td className="px-6 py-4" />
+                <td className="px-4 py-4 text-right font-mono text-base font-bold text-teal-400 border-l border-gray-700">{formatCurrency(totalCredit, { countryCode: selectedCountry, showSymbol: true })}</td>
+                <td className="px-4 py-4" />
               </tr>
             </tfoot>
           </table>

@@ -1,5 +1,6 @@
 import { useCallback, useMemo } from 'react';
 import JournalEntryModal from '../components/JournalEntryModal.jsx';
+import JournalDeleteModal from '../components/JournalDeleteModal.jsx';
 import { useAppActions, useAppState } from '../context/AppContext.jsx';
 import { formatCurrency } from '../utils/currency.js';
 
@@ -19,6 +20,7 @@ export default function JournalView() {
     currentUser,
     sales = [],
     expenses = [],
+    products = [],
     accessibleUserIds = [],
   } = useAppState();
   const { openModal, closeModal, createJournalEntry, deleteJournalEntry } = useAppActions();
@@ -122,9 +124,20 @@ export default function JournalView() {
     });
   }, [chartOfAccounts, openModal, closeModal, createJournalEntry]);
 
-  const handleDeleteEntry = useCallback((entryId) => {
-    deleteJournalEntry(entryId);
-  }, [deleteJournalEntry]);
+  const handleDeleteEntry = useCallback((entry) => {
+    openModal(JournalDeleteModal, {
+      entry,
+      sales,
+      expenses,
+      products,
+      selectedCountry,
+      onConfirm: (entryToDelete) => {
+        deleteJournalEntry(entryToDelete);
+        closeModal();
+      },
+      onCancel: closeModal,
+    });
+  }, [openModal, closeModal, deleteJournalEntry, sales, expenses, products, selectedCountry]);
 
   return (
     <div className="space-y-6 fade-in">
@@ -153,18 +166,18 @@ export default function JournalView() {
       ) : (
         <div className="perplexity-card overflow-hidden">
           <div className="responsive-table">
-            <table className="w-full text-sm">
-              <thead className="border-b border-gray-700 bg-gray-900/40 text-gray-300">
+            <table className="w-full">
+              <thead className="border-b-2 border-gray-700 bg-gray-900/60">
                 <tr>
-                  <th className="px-6 py-3 text-left font-medium uppercase tracking-wide">Date</th>
-                  <th className="px-6 py-3 text-left font-medium uppercase tracking-wide">Description</th>
-                  <th className="px-6 py-3 text-left font-medium uppercase tracking-wide">Account</th>
-                  <th className="px-6 py-3 text-right font-medium uppercase tracking-wide">Debit</th>
-                  <th className="px-6 py-3 text-right font-medium uppercase tracking-wide">Credit</th>
-                  <th className="px-6 py-3 text-right font-medium uppercase tracking-wide">Actions</th>
+                  <th className="px-4 py-4 text-left text-xs font-bold uppercase tracking-wider text-gray-300">Date</th>
+                  <th className="px-4 py-4 text-left text-xs font-bold uppercase tracking-wider text-gray-300">Description</th>
+                  <th className="px-4 py-4 text-left text-xs font-bold uppercase tracking-wider text-gray-300">Account</th>
+                  <th className="px-4 py-4 text-right text-xs font-bold uppercase tracking-wider text-blue-300">Debit</th>
+                  <th className="px-4 py-4 text-right text-xs font-bold uppercase tracking-wider text-teal-300">Credit</th>
+                  <th className="px-4 py-4 text-center text-xs font-bold uppercase tracking-wider text-gray-300">Actions</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-gray-800">
+              <tbody className="divide-y divide-gray-800/50">
                 {sortedJournal.map((entry) => {
                   const lines = entry.entries ?? [];
                   return lines.map((line, index) => {
@@ -173,39 +186,35 @@ export default function JournalView() {
                       ? `${account.name} (${account.code})`
                       : line.accountCode || 'Unknown account';
                     return (
-                      <tr key={`${entry.id}-${index}`} className="bg-gray-950/40 hover:bg-gray-900/40 transition-colors">
+                      <tr key={`${entry.id}-${index}`} className="hover:bg-gray-800/30 transition-colors">
                         {index === 0 ? (
-                          <td className="px-6 py-4 text-sm text-white align-top" rowSpan={lines.length}>
-                            <div className="space-y-1">
-                              <div className="font-medium">{entry.date}</div>
-                              <div className="text-xs text-gray-400">{entry.reference ?? 'Manual entry'}</div>
-                            </div>
+                          <td className="px-4 py-4 align-top border-r border-gray-800/30" rowSpan={lines.length}>
+                            <div className="font-semibold text-white text-sm">{entry.date}</div>
+                            <div className="text-xs text-gray-500 mt-0.5">{entry.reference ?? 'Manual entry'}</div>
                           </td>
                         ) : null}
                         {index === 0 ? (
-                          <td className="px-6 py-4 text-sm text-gray-300 align-top" rowSpan={lines.length}>
-                            {entry.description}
+                          <td className="px-4 py-4 align-top border-r border-gray-800/30" rowSpan={lines.length}>
+                            <span className="text-sm text-gray-300">{entry.description}</span>
                           </td>
                         ) : null}
-                        <td className="px-6 py-4 text-sm text-gray-200">{accountLabel}</td>
-                        <td className="px-6 py-4 text-right">
-                          {line.debit > 0 ? (
-                            <span className="inline-block px-3 py-1 rounded-lg bg-blue-500/10 border border-blue-500/20 font-mono text-blue-400">
-                              {formatAmount(line.debit, selectedCountry)}
-                            </span>
-                          ) : ''}
+                        <td className="px-4 py-4 border-r border-gray-800/30">
+                          <span className="text-sm text-gray-200">{accountLabel}</span>
                         </td>
-                        <td className="px-6 py-4 text-right font-mono text-teal-400">
-                          {line.credit > 0 ? formatAmount(line.credit, selectedCountry) : ''}
+                        <td className="px-4 py-4 text-right font-mono text-sm font-semibold text-blue-400 border-r border-gray-800/30">
+                          {line.debit > 0 ? formatAmount(line.debit, selectedCountry) : '—'}
+                        </td>
+                        <td className="px-4 py-4 text-right font-mono text-sm font-semibold text-teal-400 border-r border-gray-800/30">
+                          {line.credit > 0 ? formatAmount(line.credit, selectedCountry) : '—'}
                         </td>
                         {index === 0 ? (
-                          <td className="px-6 py-4 align-top text-right" rowSpan={lines.length}>
+                          <td className="px-4 py-4 align-top text-center" rowSpan={lines.length}>
                             <button
                               type="button"
-                              className="rounded-lg border border-red-500/60 bg-red-500/10 px-3 py-1 text-xs font-semibold text-red-300 transition-colors hover:bg-red-500/20"
-                              onClick={() => handleDeleteEntry(entry.id)}
+                              className="rounded-lg border border-red-500/60 bg-red-500/10 px-3 py-1.5 text-xs font-semibold text-red-300 transition-colors hover:bg-red-500/20"
+                              onClick={() => handleDeleteEntry(entry)}
                             >
-                              <i className="fas fa-trash mr-1" />Delete
+                              <i className="fas fa-trash mr-1.5" />Delete
                             </button>
                           </td>
                         ) : null}
@@ -214,16 +223,12 @@ export default function JournalView() {
                   });
                 })}
               </tbody>
-              <tfoot className="bg-gray-900/40">
+              <tfoot className="border-t-2 border-gray-700 bg-gray-900/60">
                 <tr>
-                  <td className="px-6 py-4 text-sm font-semibold text-white" colSpan={3}>Totals</td>
-                  <td className="px-6 py-4 text-right">
-                    <span className="inline-block px-3 py-1 rounded-lg bg-blue-500/10 border border-blue-500/20 font-mono text-blue-400 font-semibold">
-                      {formatAmount(totals.debit, selectedCountry)}
-                    </span>
-                  </td>
-                  <td className="px-6 py-4 text-right font-mono text-teal-400 font-semibold">{formatAmount(totals.credit, selectedCountry)}</td>
-                  <td className="px-6 py-4" />
+                  <td className="px-4 py-4 text-sm font-bold text-white" colSpan={3}>TOTALS</td>
+                  <td className="px-4 py-4 text-right font-mono text-base font-bold text-blue-400 border-l border-gray-700">{formatAmount(totals.debit, selectedCountry)}</td>
+                  <td className="px-4 py-4 text-right font-mono text-base font-bold text-teal-400 border-l border-gray-700">{formatAmount(totals.credit, selectedCountry)}</td>
+                  <td className="px-4 py-4" />
                 </tr>
               </tfoot>
             </table>

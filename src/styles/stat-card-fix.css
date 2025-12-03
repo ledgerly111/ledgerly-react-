@@ -20,3 +20,15 @@
     line-height: 1 !important;
     vertical-align: middle !important;
 }
+
+/* === FIX: Prevent text selection on table amounts === */
+/* Removes the selection highlight when clicking on debit/credit amounts */
+.text-blue-400,
+.text-teal-400,
+.font-mono {
+    -webkit-user-select: none;
+    -moz-user-select: none;
+    -ms-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+}
