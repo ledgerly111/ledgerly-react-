@@ -7561,3 +7561,112 @@ header.navbar .navbar__icon-button[data-action='start-quick-sale'] {
     border-top-color: rgba(148, 163, 184, 0.25);
     box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.05);
 }
+/* AI category card - plain with white border and smaller size */
+.ai-category-card {
+    background: transparent !important;
+    border: 2px solid white !important;
+    box-shadow: none !important;
+    padding: 1rem !important;
+    min-height: 120px !important;
+}
+
+.ai-category-card::before {
+    display: none !important;
+}
+
+
+/* Override AI gradient text to white */
+.ai-gradient-text {
+    background: none !important;
+    color: white !important;
+    -webkit-text-fill-color: white !important;
+}
+
+
+/* Change AI category icon to white */
+.ai-category-icon-wrapper {
+    background: transparent !important;
+    border: none !important;
+    color: white !important;
+}
+
+.ai-category-icon-wrapper svg {
+    color: white !important;
+    stroke: white !important;
+}
+
+
+/* Pulse animation for category icons */
+@keyframes categoryIconPulse {
+    0%, 100% {
+        opacity: 1;
+        transform: scale(1);
+    }
+    50% {
+        opacity: 0.6;
+        transform: scale(0.95);
+    }
+}
+
+.ai-category-icon-wrapper {
+    animation: categoryIconPulse 2s ease-in-out infinite !important;
+}
+
+
+/* Update icon wrapper - black border, no animation */
+.ai-category-icon-wrapper {
+    border: 2px solid black !important;
+    animation: none !important;
+}
+
+
+/* Light theme - black borders and icons */
+.theme-light .ai-category-card {
+    border: 2px solid black !important;
+}
+
+.theme-light .ai-category-icon-wrapper {
+    color: black !important;
+    border: 2px solid black !important;
+}
+
+.theme-light .ai-category-icon-wrapper svg {
+    color: black !important;
+    stroke: black !important;
+}
+
+.theme-light .ai-gradient-text {
+    color: black !important;
+    -webkit-text-fill-color: black !important;
+}
+
+
+/* Grey background for category cards in dark themes */
+.ai-category-card {
+    background: rgba(50, 50, 50, 0.5) !important;
+}
+
+.theme-black .ai-category-card {
+    background: rgba(40, 40, 40, 0.6) !important;
+}
+
+
+/* White borders for icon wrappers in dark themes */
+.ai-category-icon-wrapper {
+    border: 2px solid white !important;
+}
+
+.theme-black .ai-category-icon-wrapper {
+    border: 2px solid white !important;
+}
+
+/* Better background color for category cards matching default theme cards */
+.ai-category-card {
+    background: rgba(26, 31, 46, 0.6) !important;
+    backdrop-filter: blur(10px);
+}
+
+.theme-black .ai-category-card {
+    background: rgba(12, 12, 12, 0.8) !important;
+}
+

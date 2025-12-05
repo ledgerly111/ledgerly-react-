@@ -4154,6 +4154,9 @@ function appReducer(state, action) {
       const timestamp = new Date().toISOString();
       const userName = state.currentUser?.name || 'User';
 
+      // Generate a shared log number for all related logs
+      const sharedLogNumber = Date.now();
+
       // Create base log for journal entry deletion
       logs.push(createLogEntry({
         actor: { id: state.currentUser?.id || null, name: userName },
@@ -4165,6 +4168,7 @@ function appReducer(state, action) {
           description: entryToDelete.description,
         },
         message: `Journal entry deleted: ${entryToDelete.description || 'Untitled'}`,
+        logNumber: sharedLogNumber,
       }));
 
       // Handle reversal based on entry source
@@ -4204,6 +4208,7 @@ function appReducer(state, action) {
                 stock: { from: currentStock, to: restoredStock },
               },
               message: `Inventory restored for "${product.name}": +${baseQuantity} units (Sale #${saleId} reversed)`,
+              logNumber: sharedLogNumber,
             }));
 
             return {
@@ -4226,6 +4231,7 @@ function appReducer(state, action) {
               customerName: sale.customer?.name || 'Customer',
             },
             message: `Sale #${saleId} reversed due to journal entry deletion`,
+            logNumber: sharedLogNumber,
           }));
         } else {
           logs.push(createLogEntry({
@@ -4233,6 +4239,7 @@ function appReducer(state, action) {
             actionType: 'DELETE_JOURNAL',
             entity: { id: saleId },
             message: `Warning: Sale #${saleId} not found for reversal (already deleted or missing)`,
+            logNumber: sharedLogNumber,
           }));
         }
       }
@@ -4253,6 +4260,7 @@ function appReducer(state, action) {
               description: expense.description || 'Untitled',
             },
             message: `Expense #${expenseId} reversed due to journal entry deletion`,
+            logNumber: sharedLogNumber,
           }));
         } else {
           logs.push(createLogEntry({
@@ -4260,6 +4268,7 @@ function appReducer(state, action) {
             actionType: 'DELETE_JOURNAL',
             entity: { id: expenseId },
             message: `Warning: Expense #${expenseId} not found for reversal (already deleted or missing)`,
+            logNumber: sharedLogNumber,
           }));
         }
       }
@@ -4271,6 +4280,7 @@ function appReducer(state, action) {
           actionType: 'DELETE_JOURNAL',
           entity: { id: purchaseOrderId },
           message: `Purchase order #${purchaseOrderId} journal entry reversed${source === 'purchase-order-payment' ? ' (payment)' : ''}`,
+          logNumber: sharedLogNumber,
         }));
 
         // Note: We don't automatically delete PO or reduce inventory since
@@ -4284,6 +4294,7 @@ function appReducer(state, action) {
           actionType: 'DELETE_JOURNAL',
           entity: { id: entryToDelete.id, description: entryToDelete.description },
           message: 'Manual journal entry deleted (no reversals needed)',
+          logNumber: sharedLogNumber,
         }));
       }
 
@@ -4308,8 +4319,8 @@ function appReducer(state, action) {
         return true;
       });
 
-      // Add all logs to state
-      nextState.logs = [...(state.logs || []), ...logs];
+      // Add all logs to state (PREPEND to show latest logs on top)
+      nextState.logs = [...logs, ...(state.logs || [])];
 
       return nextState;
     }

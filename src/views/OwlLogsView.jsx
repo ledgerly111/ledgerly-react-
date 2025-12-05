@@ -68,31 +68,57 @@ function extractMessageText(message = []) {
 export default function OwlLogsView() {
   const { logs = [] } = useAppState();
   const [filterTerm, setFilterTerm] = useState('');
+  const [selectedLogNumber, setSelectedLogNumber] = useState(null);
 
   const entries = useMemo(() => (Array.isArray(logs) ? logs : []), [logs]);
 
   const filteredEntries = useMemo(() => {
-    const term = filterTerm.trim().toLowerCase();
-    if (!term) {
-      return entries;
+    let result = entries;
+
+    // Filter by log number if selected
+    if (selectedLogNumber !== null) {
+      result = result.filter((entry) => entry?.logNumber === selectedLogNumber);
     }
-    return entries.filter((entry) => {
-      const code = String(entry?.code ?? '').toLowerCase();
-      const actorName = String(entry?.actorName ?? '').toLowerCase();
-      const messageText = extractMessageText(entry?.message).toLowerCase();
-      return (
-        code.includes(term) ||
-        actorName.includes(term) ||
-        messageText.includes(term)
-      );
-    });
-  }, [entries, filterTerm]);
+
+    // Then filter by search term
+    const term = filterTerm.trim().toLowerCase();
+    if (term) {
+      result = result.filter((entry) => {
+        const code = String(entry?.code ?? '').toLowerCase();
+        const actorName = String(entry?.actorName ?? '').toLowerCase();
+        const messageText = extractMessageText(entry?.message).toLowerCase();
+        return (
+          code.includes(term) ||
+          actorName.includes(term) ||
+          messageText.includes(term)
+        );
+      });
+    }
+
+    return result;
+  }, [entries, filterTerm, selectedLogNumber]);
 
   const handleFilterByCode = useCallback((code) => {
     if (!code) {
       return;
     }
     setFilterTerm(code);
+    setSelectedLogNumber(null); // Clear log number filter when filtering by code
+  }, []);
+
+  const handleFilterByLogNumber = useCallback((logNumber) => {
+    if (logNumber === selectedLogNumber) {
+      // Toggle off if clicking the same log number
+      setSelectedLogNumber(null);
+    } else {
+      setSelectedLogNumber(logNumber);
+      setFilterTerm(''); // Clear text filter when filtering by log number
+    }
+  }, [selectedLogNumber]);
+
+  const clearAllFilters = useCallback(() => {
+    setFilterTerm('');
+    setSelectedLogNumber(null);
   }, []);
 
   const renderMessage = useCallback((entry) => {
@@ -128,15 +154,43 @@ export default function OwlLogsView() {
         </div>
       </header>
 
+      {(filterTerm || selectedLogNumber !== null) && (
+        <div className="flex items-center gap-2 text-xs">
+          {selectedLogNumber !== null && (
+            <span className="rounded-lg bg-blue-500/20 border border-blue-500/30 px-3 py-1 text-blue-300">
+              Showing logs with number: {formatLogNumber(selectedLogNumber, 0)}
+            </span>
+          )}
+          {filterTerm && (
+            <span className="rounded-lg bg-purple-500/20 border border-purple-500/30 px-3 py-1 text-purple-300">
+              Filter: "{filterTerm}"
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={clearAllFilters}
+            className="rounded-lg bg-red-500/20 border border-red-500/30 px-3 py-1 text-red-300 hover:bg-red-500/30 transition-colors"
+          >
+            <i className="fas fa-times mr-1" /> Clear Filters
+          </button>
+        </div>
+      )}
+
       <div className="owl-logs-main overflow-hidden rounded-xl border shadow-inner">
         <div className="owl-logs-header border-b px-4 py-3">
-          <span className="text-[11px] font-semibold uppercase tracking-[0.4em]">
-            :: Audit Stream
+          <span className="text-[11px] font-semibold uppercase tracking-[0.4em] flex items-center gap-2">
+            <span className="inline-flex gap-0.5">
+              <span className="inline-block animate-pulse" style={{ animationDuration: '2s' }}>:</span>
+              <span className="inline-block animate-pulse" style={{ animationDuration: '2s', animationDelay: '0.5s' }}>:</span>
+            </span>
+            Audit Stream
           </span>
         </div>
         {filteredEntries.length === 0 ? (
           <div className="owl-logs-empty px-6 py-12 text-center text-xs">
-            No Owl Logs captured yet. System events will appear here automatically.
+            {filterTerm || selectedLogNumber !== null
+              ? 'No logs match the current filters.'
+              : 'No Owl Logs captured yet. System events will appear here automatically.'}
           </div>
         ) : (
           <ul className="owl-logs-list max-h-[70vh] overflow-y-auto divide-y">
@@ -146,6 +200,7 @@ export default function OwlLogsView() {
               const actorName = entry?.actorName ?? 'System';
               const entryId = entry?.id ?? `${code}-${index}`;
               const formattedNumber = formatLogNumber(entry?.logNumber, entries.length - index);
+              const isLogNumberActive = selectedLogNumber !== null && selectedLogNumber === entry?.logNumber;
 
               return (
                 <li
@@ -153,9 +208,15 @@ export default function OwlLogsView() {
                   className="owl-logs-entry group px-4 py-4 transition-colors"
                 >
                   <div className="flex flex-wrap items-center gap-2 text-xs">
-                    <span className="owl-logs-number rounded px-2 py-0.5 font-semibold uppercase tracking-wide">
+                    <button
+                      type="button"
+                      onClick={() => handleFilterByLogNumber(entry?.logNumber)}
+                      className={`owl-logs-number rounded px-2 py-0.5 font-semibold uppercase tracking-wide transition-colors cursor-pointer ${isLogNumberActive ? 'ring-2 ring-blue-400' : 'hover:bg-blue-500/20'
+                        }`}
+                      title="Click to filter logs with this number"
+                    >
                       [LOG: {formattedNumber}]
-                    </span>
+                    </button>
                     <button
                       type="button"
                       onClick={() => handleFilterByCode(code)}
